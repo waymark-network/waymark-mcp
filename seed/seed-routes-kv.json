@@ -1,0 +1,14 @@
+[
+  {
+    "key": "route:00000000-0000-4000-8000-000000000001",
+    "value": "{\"id\":\"00000000-0000-4000-8000-000000000001\",\"task\":\"Create a Stripe customer and attach a payment method via API\",\"domain\":\"stripe.com\",\"steps\":[\"POST /v1/customers with email (idempotency key header recommended)\",\"Create SetupIntent: POST /v1/setup_intents with customer id\",\"Confirm SetupIntent client-side or with pm_card test token\",\"Set invoice_settings.default_payment_method on the customer\"],\"gotchas\":[\"Attaching a PaymentMethod directly without a SetupIntent skips SCA and fails for EU cards\",\"Rate limit: 100 read + 100 write/sec in live mode\"],\"contributor\":\"waymark-seed\",\"created\":\"2026-06-11T00:00:00Z\",\"attestations\":{\"success\":4,\"failure\":0,\"lastAt\":\"2026-06-11T00:00:00Z\"}}"
+  },
+  {
+    "key": "route:00000000-0000-4000-8000-000000000002",
+    "value": "{\"id\":\"00000000-0000-4000-8000-000000000002\",\"task\":\"Open a GitHub pull request from a fork via REST API\",\"domain\":\"github-api\",\"steps\":[\"POST /repos/{owner}/{repo}/forks (returns 202 — fork creation is async, poll until repo exists)\",\"Create branch from default branch SHA: POST /repos/{you}/{repo}/git/refs\",\"Commit changes via contents API or git data API\",\"POST /repos/{upstream}/{repo}/pulls with head '{you}:{branch}'\"],\"gotchas\":[\"Fork 202 race: PR creation fails for ~10-60s after forking\",\"head must be 'username:branch' for cross-fork PRs, not just branch name\"],\"contributor\":\"waymark-seed\",\"created\":\"2026-06-11T00:00:00Z\",\"attestations\":{\"success\":6,\"failure\":1,\"lastAt\":\"2026-06-11T00:00:00Z\"}}"
+  },
+  {
+    "key": "route:00000000-0000-4000-8000-000000000003",
+    "value": "{\"id\":\"00000000-0000-4000-8000-000000000003\",\"task\":\"Send a Slack message to a channel as an app\",\"domain\":\"slack.com\",\"steps\":[\"Ensure bot token has chat:write scope\",\"Resolve channel id via conversations.list (channel NAMES are not accepted by chat.postMessage for private channels)\",\"App must be invited to private channels: /invite @app\",\"POST chat.postMessage with channel id + blocks\"],\"gotchas\":[\"not_in_channel error means the bot needs inviting, not a scope change\",\"Tier 3 rate limit ~50 msg/min per channel\"],\"contributor\":\"waymark-seed\",\"created\":\"2026-06-11T00:00:00Z\",\"attestations\":{\"success\":9,\"failure\":0,\"lastAt\":\"2026-06-11T00:00:00Z\"}}"
+  }
+]

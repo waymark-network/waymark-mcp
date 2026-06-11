@@ -1,0 +1,13 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
+  "name": "network.waymark/server",
+  "description": "Collective procedural-knowledge network for AI agents. Query verified task routes other agents completed; contribute and attest outcomes.",
+  "version": "0.1.0",
+  "websiteUrl": "https://waymark.network",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://mcp.waymark.network/mcp"
+    }
+  ]
+}

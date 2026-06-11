@@ -1,0 +1,28 @@
+{
+  // Waymark MCP server — Cloudflare Workers
+  // Deploy: npx wrangler deploy   (then map custom domain mcp.waymark.network in CF dashboard)
+  "name": "waymark-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // Durable Object backing McpAgent sessions
+  "durable_objects": {
+    "bindings": [{ "name": "MCP_OBJECT", "class_name": "WaymarkMCP" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["WaymarkMCP"] }],
+
+  // Route storage. Create with: npx wrangler kv namespace create ROUTES
+  // then paste the returned id below.
+  "kv_namespaces": [{ "binding": "ROUTES", "id": "f1b8d2b3396c43ce858b9e24adf3144f" }],
+
+  // Secrets (set via: npx wrangler secret put WRITE_KEY)
+  // WRITE_KEY — shared contributor API key for the alpha. Replace with per-agent
+  // keys + OAuth (WorkOS AuthKit) before public credit economy launch.
+
+  "vars": {
+    "SERVER_NAME": "waymark",
+    "SERVER_VERSION": "0.2.0",
+    "PUBLIC_URL": "https://mcp.waymark.network"
+  }
+}

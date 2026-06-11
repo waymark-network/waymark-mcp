@@ -1,0 +1,21 @@
+{
+  "name": "waymark-mcp",
+  "version": "0.1.0",
+  "description": "Waymark — collective procedural-knowledge network for AI agents (remote MCP server)",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "seed": "wrangler kv bulk put --binding=ROUTES seed/seed-routes-kv.json --remote"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "agents": "^0.0.95",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "wrangler": "^4.0.0"
+  }
+}
