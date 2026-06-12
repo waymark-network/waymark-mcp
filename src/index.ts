@@ -237,6 +237,36 @@ async function backfillVectors(env: Env, key: string | null, since?: string | nu
   return Response.json({ embedded: n });
 }
 
+/** Server-side index merge (WRITE_KEY-gated). The client sends only route IDs
+ * (a few KB); the Worker fetches the full routes from KV and merges them into
+ * idx:routes in-place. Replaces the failure-prone multi-MB client-side index
+ * PUT (Run 22 incident: 7 MB body died with SSL resets ×4 from the session's
+ * network path while the 280 KB bulk write sailed through).
+ * Idempotent: merge is keyed by route id — re-posting the same ids is safe.
+ * Subrequest budget: ≤500 ids/call keeps gets + index read/write well under
+ * the Workers per-request subrequest limit. */
+async function mergeIndex(env: Env, key: string | null, request: Request): Promise<Response> {
+  if (key !== env.WRITE_KEY) return new Response("forbidden", { status: 403 });
+  let ids: string[] = [];
+  try {
+    const body = (await request.json()) as { ids?: unknown };
+    if (Array.isArray(body.ids)) ids = body.ids.filter((x): x is string => typeof x === "string" && /^[0-9a-f-]{36}$/.test(x));
+  } catch { /* fall through to the empty-ids 400 */ }
+  if (ids.length === 0) return Response.json({ error: "body must be JSON {ids: string[]} of route UUIDs" }, { status: 400 });
+  if (ids.length > 500) return Response.json({ error: "max 500 ids per call; chunk and repeat" }, { status: 400 });
+  const routes: Route[] = [];
+  for (let i = 0; i < ids.length; i += 100) routes.push(...await fetchRoutes(env, ids.slice(i, i + 100)));
+  const found = new Set(routes.map((r) => r.id));
+  const missing = ids.filter((id) => !found.has(id));
+  // Fresh read immediately before write (same last-writer-wins discipline as patchIndex).
+  const idx = await getIndex(env);
+  const byId = new Map(idx.map((e) => [e.id, e] as const));
+  let added = 0, updated = 0;
+  for (const r of routes) { byId.has(r.id) ? updated++ : added++; byId.set(r.id, r); }
+  await env.ROUTES.put(INDEX_KEY, JSON.stringify([...byId.values()]));
+  return Response.json({ merged: routes.length, added, updated, missing, index_total: byId.size });
+}
+
 export class WaymarkMCP extends McpAgent<Env> {
   server = new McpServer({ name: "waymark", version: "0.2.0" });
 
@@ -490,6 +520,9 @@ export default {
     if (pathname === "/search") {
       const q = searchParams.get("q") ?? "";
       return searchEndpoint(env, q, ctx);
+    }
+    if (pathname === "/admin/merge-index" && request.method === "POST") {
+      return mergeIndex(env, request.headers.get("x-write-key"), request);
     }
     if (pathname === "/admin/backfill-vectors" && request.method === "POST") {
       return backfillVectors(env, request.headers.get("x-write-key"), searchParams.get("since"));
