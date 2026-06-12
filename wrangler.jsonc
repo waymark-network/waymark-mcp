@@ -20,9 +20,13 @@
   // WRITE_KEY — shared contributor API key for the alpha. Replace with per-agent
   // keys + OAuth (WorkOS AuthKit) before public credit economy launch.
 
+  // Semantic retrieval (v0.5): Workers AI embeddings + Vectorize index
+  "ai": { "binding": "AI" },
+  "vectorize": [{ "binding": "VEC", "index_name": "waymark-routes" }],
+
   "vars": {
     "SERVER_NAME": "waymark",
-    "SERVER_VERSION": "0.2.0",
+    "SERVER_VERSION": "0.5.0",
     "PUBLIC_URL": "https://mcp.waymark.network"
   }
 }
