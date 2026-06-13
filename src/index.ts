@@ -50,7 +50,7 @@ interface Route {
   verification?: { status: "verified" | "sampled" | "unverified"; method?: string; at?: string | null };
 }
 
-type EventType = "query" | "contribute" | "attest";
+type EventType = "query" | "contribute" | "attest" | "register";
 interface ActivityEvent {
   t: string;               // ISO timestamp
   type: EventType;
@@ -170,6 +170,7 @@ function rankIndex(idx: IdxEntry[], query: string, domainHint: string | undefine
     if (domainHint && e.domain.toLowerCase() === domainHint.toLowerCase()) s *= 1.5;
     const trust = (e.attestations.success + 1) / (e.attestations.success + e.attestations.failure + 2);
     s *= 0.5 + trust; // trust scales 0.5x–1.5x
+    if (e.verification?.status === "unverified") s *= UNVERIFIED_SERVING_FACTOR; // BLOCKER #1: don't serve unverified as authoritative
     const coverage = matched.size / Math.min(qSet.size, 6);
     scored.push({ e, score: s, coverage });
   }
@@ -194,6 +195,17 @@ async function fetchRoutes(env: Env, ids: string[]): Promise<Route[]> {
 const EMBED_MODEL = "@cf/baai/bge-base-en-v1.5";
 const VEC_MIN_SCORE = 0.56; // calibrated: exact ~0.94, paraphrase ~0.60+, garbage ≤0.49
 
+/* Trust gate for self-serve contributions (v0.6 security review BLOCKER #1):
+ * a community route is verification:"unverified" until the canary re-checks it
+ * against live docs. Unverified routes MUST NOT be served as authoritative, or
+ * one contributor key could rank a poisoned route #1 for a task. We don't hide
+ * them (that would starve the flywheel — they'd never get attested), but we
+ * deprioritize them hard so any verified/operator route wins, and the agent
+ * always sees verification.status in the response. */
+const UNVERIFIED_SERVING_FACTOR = 0.12;
+const servingScore = (r: Route, base: number) =>
+  base * (r.verification?.status === "unverified" ? UNVERIFIED_SERVING_FACTOR : 1);
+
 async function embed(env: Env, texts: string[]): Promise<number[][]> {
   const res = (await env.AI.run(EMBED_MODEL, { text: texts })) as { data: number[][] };
   return res.data;
@@ -214,11 +226,17 @@ async function upsertVector(env: Env, route: Route): Promise<void> {
 async function retrieve(env: Env, query: string, domainHint: string | undefined, limit: number): Promise<Route[]> {
   try {
     const qv = await embedQuery(env, query + (domainHint ? " — " + domainHint : ""));
-    const res = await env.VEC.query(qv, { topK: Math.max(limit * 2, 8), returnMetadata: "none" });
-    const hits = res.matches.filter((m) => m.score >= VEC_MIN_SCORE).slice(0, limit);
-    if (hits.length > 0) {
-      const routes = await fetchRoutes(env, hits.map((m) => m.id));
-      if (routes.length > 0) return routes;
+    const res = await env.VEC.query(qv, { topK: Math.max(limit * 3, 12), returnMetadata: "none" });
+    const cand = res.matches.filter((m) => m.score >= VEC_MIN_SCORE);
+    if (cand.length > 0) {
+      const routes = await fetchRoutes(env, cand.map((m) => m.id));
+      if (routes.length > 0) {
+        // BLOCKER #1: re-rank by verification-adjusted score so a verified route
+        // always outranks an unverified one at similar semantic distance.
+        const score = new Map(cand.map((m) => [m.id, m.score]));
+        routes.sort((a, b) => servingScore(b, score.get(b.id) ?? 0) - servingScore(a, score.get(a.id) ?? 0));
+        return routes.slice(0, limit);
+      }
     }
     // Semantic miss with a domain hint can still have an exact keyword match.
     const idx = await getIndex(env);
@@ -433,32 +451,60 @@ export class WaymarkMCP extends McpAgent<Env> {
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
       },
       async ({ api_key, task, domain, steps, gotchas, contributor }) => {
-        if (api_key !== env.WRITE_KEY) {
-          await logEvent(env, "contribute", { rejected: "bad_key", domain });
-          return { content: [{ type: "text" as const, text: "Invalid API key. Get a contributor key at https://waymark.network" }], isError: true };
+        // Auth (v0.6): admin/factory WRITE_KEY OR a self-serve contributor key.
+        // Self-serve keys are what let the network grow from external agents
+        // rather than only the operator — see the contributor-key block below.
+        const isAdmin = api_key === env.WRITE_KEY;
+        let keyRec: { rec: ContribKey; storeKey: string } | null = null;
+        if (!isAdmin) {
+          keyRec = await lookupContribKey(env, api_key);
+          if (!keyRec || keyRec.rec.revoked) {
+            await logEvent(env, "contribute", { rejected: keyRec ? "revoked_key" : "bad_key", domain });
+            return { content: [{ type: "text" as const, text: "Invalid or revoked API key. Get a free contributor key: call waymark_register, or POST https://mcp.waymark.network/v1/keys {\"handle\":\"your-agent\"}." }], isError: true };
+          }
+          // Per-key hourly contribution cap — bounds corpus poisoning by any one key.
+          const kb = new Date().toISOString().slice(0, 13); // YYYY-MM-DDTHH
+          const kRl = `ckcrl:${keyRec.storeKey.slice(3)}:${kb}`;
+          const kUsed = parseInt((await env.ROUTES.get(kRl)) ?? "0", 10);
+          if (kUsed >= CONTRIB_KEY_HOURLY_CAP) {
+            await logEvent(env, "contribute", { rejected: "rate_capped", domain });
+            return { content: [{ type: "text" as const, text: JSON.stringify({ status: "rate_capped", detail: `Per-key cap of ${CONTRIB_KEY_HOURLY_CAP} contributions/hour reached. Retry later.` }) }], isError: true };
+          }
+          await env.ROUTES.put(kRl, String(kUsed + 1), { expirationTtl: 7200 });
         }
         if (looksSensitive([task, domain, ...steps, ...gotchas].join(" "))) {
           await logEvent(env, "contribute", { rejected: "sensitive_content", domain });
           return { content: [{ type: "text" as const, text: "Rejected: submission appears to contain credentials/secrets. Sanitize and resubmit procedure-only content." }], isError: true };
         }
+        // Attribution: for self-serve keys, trust the registered handle, not a
+        // free-text field the caller could spoof.
+        const handle = isAdmin ? contributor : (keyRec!.rec.handle || contributor);
+        const src = isAdmin ? "operator" : "community";
         const id = crypto.randomUUID();
         const nowIso = new Date().toISOString();
         const route: Route = {
-          id, task, domain, steps, gotchas, contributor,
+          id, task, domain, steps, gotchas, contributor: handle,
           created: nowIso,
           attestations: { success: 0, failure: 0, lastAt: null },
-          // Community contributions are unverified until the canary/factory checks them.
-          verification: { status: "unverified", method: "community-contrib", at: nowIso },
+          // Neither path claims "verified" — that status is earned only when the
+          // canary re-checks the route against live docs. Method records origin.
+          verification: { status: "unverified", method: isAdmin ? "operator-contrib" : "community-contrib", at: nowIso },
         };
         await env.ROUTES.put(`route:${id}`, JSON.stringify(route));
         await patchIndex(env, (idx) => [...idx, route]);
         await upsertVector(env, route);
+        if (keyRec) {
+          keyRec.rec.contributions++;
+          keyRec.rec.lastAt = nowIso;
+          await env.ROUTES.put(keyRec.storeKey, JSON.stringify(keyRec.rec));
+        }
         await logEvent(env, "contribute", {
           route_id: id,
           task: task.slice(0, 140),
           domain,
-          contributor,
+          contributor: handle,
           steps: steps.length,
+          src,
         });
         return { content: [{ type: "text" as const, text: JSON.stringify({ route_id: id, status: "accepted", credits_earned: 1 }) }] };
       }
@@ -511,6 +557,35 @@ export class WaymarkMCP extends McpAgent<Env> {
           note: note ? note.slice(0, 140) : null,
         });
         return { content: [{ type: "text" as const, text: JSON.stringify({ recorded: true, route_id, attestations: route.attestations }) }] };
+      }
+    );
+
+    this.server.registerTool(
+      "waymark_register",
+      {
+        title: "Register for a contributor key",
+        description:
+          "Get a free contributor API key so you can submit routes with waymark_contribute. " +
+          "The key is returned once — store it. Use one handle per agent/org.",
+        inputSchema: {
+          handle: z.string().min(2).max(60).describe("Your agent/org handle, e.g. 'acme-sales-agent'"),
+        },
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+      },
+      async ({ handle }) => {
+        const h = handle.trim();
+        if (!/^[a-zA-Z0-9 _.\-\/@]{2,60}$/.test(h)) {
+          return { content: [{ type: "text" as const, text: "Invalid handle. Use 2–60 chars: letters, digits, space, _ . - / @" }], isError: true };
+        }
+        if (RESERVED_HANDLE.test(h)) {
+          return { content: [{ type: "text" as const, text: "That handle is reserved. Choose a handle that doesn't impersonate Waymark/operator/official identities." }], isError: true };
+        }
+        const res = await createContribKey(env, h);
+        if (!res.ok) {
+          return { content: [{ type: "text" as const, text: JSON.stringify({ status: res.reason, detail: "Key issuance temporarily rate-limited network-wide. Retry shortly." }) }], isError: true };
+        }
+        await logEvent(env, "register", { handle: h });
+        return { content: [{ type: "text" as const, text: JSON.stringify({ api_key: res.key, handle: h, note: "Store this key now — it is shown only once. Pass it as api_key in waymark_contribute." }) }] };
       }
     );
   }
@@ -571,6 +646,228 @@ function conditional(request: Request, body: string, etag: string, headers: Reco
     return new Response(null, { status: 304, headers: h });
   }
   return new Response(body, { headers: h });
+}
+
+/* ---------------- Self-serve contributor keys (v0.6) ----------------
+ * Until v0.6, waymark_contribute was gated on the single shared WRITE_KEY, so
+ * only the operator/factory could add routes — the network could not grow from
+ * external agents, which is the actual flywheel. v0.6 issues per-agent keys:
+ *   - Raw key `wmk_<48 hex>` is shown ONCE; only its SHA-256 is stored
+ *     (KV key ck:<hash>), so a KV dump never yields a usable key.
+ *   - Per-key hourly contribution cap bounds corpus poisoning by any one key.
+ *   - Per-IP + global hourly issuance caps slow mass key minting.
+ *   - Community contributions stay verification:"unverified" (no trust/serving
+ *     priority) until the canary re-verifies — same trust model as before.
+ *   - WRITE_KEY remains the admin/factory path, unchanged and separate. */
+
+const CONTRIB_KEY_HOURLY_CAP = 20;        // sanitized routes per key per hour
+const KEY_ISSUE_IP_HOURLY_CAP = 5;        // new keys per IP per hour (HTTP path)
+// Network-wide new-key ceiling/hour. Bounds the MCP register path (which has no
+// per-IP attribution) — worst case now ~50 keys × 20 = 1000 *unverified* writes/hr,
+// all heavily deprioritized in serving (UNVERIFIED_SERVING_FACTOR) and prunable.
+// NOTE (review #3): KV counters are non-atomic, so caps are soft under burst
+// concurrency; DO/D1-backed atomic counters are the planned hardening.
+const KEY_ISSUE_GLOBAL_HOURLY_CAP = 50;
+
+/** Reserved handles an external key may not claim (anti-impersonation, review #8). */
+const RESERVED_HANDLE = /(^|[^a-z])(waymark|operator|official|admin|staff|mc[\s_-]?software)([^a-z]|$)|seed/i;
+
+interface ContribKey { handle: string; created: string; revoked: boolean; contributions: number; lastAt: string | null }
+
+async function sha256hex(s: string): Promise<string> {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** Resolve a raw contributor key to its stored record (or null). */
+async function lookupContribKey(env: Env, rawKey: string): Promise<{ rec: ContribKey; storeKey: string } | null> {
+  if (typeof rawKey !== "string" || !/^wmk_[0-9a-f]{48}$/.test(rawKey)) return null;
+  const storeKey = `ck:${await sha256hex(rawKey)}`;
+  const raw = await env.ROUTES.get(storeKey);
+  if (!raw) return null;
+  return { rec: JSON.parse(raw) as ContribKey, storeKey };
+}
+
+/** Mint a key (shared by the MCP tool and the HTTP endpoint). Global cap only;
+ * the HTTP endpoint adds a per-IP cap on top. */
+async function createContribKey(env: Env, handle: string): Promise<{ ok: true; key: string } | { ok: false; reason: string }> {
+  const bucket = new Date().toISOString().slice(0, 13);
+  const gKey = `krl:global:${bucket}`;
+  const used = parseInt((await env.ROUTES.get(gKey)) ?? "0", 10);
+  if (used >= KEY_ISSUE_GLOBAL_HOURLY_CAP) return { ok: false, reason: "global_rate_capped" };
+  await env.ROUTES.put(gKey, String(used + 1), { expirationTtl: 7200 });
+  const rawKey = "wmk_" + [...crypto.getRandomValues(new Uint8Array(24))].map((b) => b.toString(16).padStart(2, "0")).join("");
+  const rec: ContribKey = { handle, created: new Date().toISOString(), revoked: false, contributions: 0, lastAt: null };
+  await env.ROUTES.put(`ck:${await sha256hex(rawKey)}`, JSON.stringify(rec));
+  await env.ROUTES.get("counter:keys").then((v) => env.ROUTES.put("counter:keys", String(parseInt(v ?? "0", 10) + 1))).catch(() => {});
+  return { ok: true, key: rawKey };
+}
+
+/** POST /v1/keys {handle} — public, IP-rate-limited self-serve key issuance. */
+async function issueKeyHttp(env: Env, request: Request): Promise<Response> {
+  let handle = "";
+  try { handle = String((((await request.json()) as { handle?: unknown }) ?? {}).handle ?? "").trim(); } catch { /* 400 below */ }
+  if (!/^[a-zA-Z0-9 _.\-\/@]{2,60}$/.test(handle)) {
+    return Response.json({ error: "handle required: 2–60 chars (letters, digits, space, _ . - / @)" }, { status: 400, headers: CORS });
+  }
+  if (RESERVED_HANDLE.test(handle)) {
+    return Response.json({ error: "handle reserved: cannot impersonate Waymark/operator/official identities" }, { status: 400, headers: CORS });
+  }
+  const ip = request.headers.get("cf-connecting-ip") ?? "0.0.0.0";
+  const bucket = new Date().toISOString().slice(0, 13);
+  const ipKey = `ckrl:${ip}:${bucket}`;
+  const ipUsed = parseInt((await env.ROUTES.get(ipKey)) ?? "0", 10);
+  if (ipUsed >= KEY_ISSUE_IP_HOURLY_CAP) {
+    return Response.json({ error: `rate limited: max ${KEY_ISSUE_IP_HOURLY_CAP} keys/hour from one IP` }, { status: 429, headers: CORS });
+  }
+  await env.ROUTES.put(ipKey, String(ipUsed + 1), { expirationTtl: 7200 });
+  const res = await createContribKey(env, handle);
+  if (!res.ok) return Response.json({ error: "network-wide key issuance rate limit reached; retry shortly" }, { status: 429, headers: CORS });
+  await logEvent(env, "register", { handle });
+  return Response.json({ api_key: res.key, handle, note: "Store this key now — it is shown only once. Use it as api_key in waymark_contribute." }, { headers: CORS });
+}
+
+/** POST /admin/revoke-key {key|key_hash} — WRITE_KEY-gated. */
+async function revokeKey(env: Env, adminKey: string | null, request: Request): Promise<Response> {
+  if (adminKey !== env.WRITE_KEY) return new Response("forbidden", { status: 403 });
+  let body: { key?: string; key_hash?: string };
+  try { body = await request.json(); } catch { return Response.json({ error: "bad json" }, { status: 400 }); }
+  let storeKey: string | null = null;
+  if (body.key) { const r = await lookupContribKey(env, body.key); storeKey = r?.storeKey ?? null; }
+  else if (body.key_hash && /^[0-9a-f]{64}$/.test(body.key_hash)) storeKey = `ck:${body.key_hash}`;
+  if (!storeKey) return Response.json({ error: "provide a valid key or key_hash" }, { status: 400 });
+  const raw = await env.ROUTES.get(storeKey);
+  if (!raw) return Response.json({ revoked: false, reason: "not found" }, { status: 404 });
+  const rec = JSON.parse(raw) as ContribKey;
+  rec.revoked = true;
+  await env.ROUTES.put(storeKey, JSON.stringify(rec));
+  return Response.json({ revoked: true, handle: rec.handle });
+}
+
+/* ---------------- Demand dashboard (v0.6) ----------------
+ * Route COUNT is a supply/vanity metric. /demand tracks the numbers that show a
+ * network actually forming: real (non-playground) agent queries, coverage gaps
+ * (zero-result queries), attestation rate, community contributions, and keys
+ * issued. Computed from the activity log (≤1000 recent events, 30-day TTL). */
+
+const PLAYGROUND_DOMAINS = new Set(["web-playground", "playground"]);
+
+interface DemandMetrics {
+  window: string;
+  queries_total: number; queries_real: number; queries_playground: number;
+  queries_zero_result: number; zero_result_rate: number;
+  attestations: number; attest_success: number; attest_failure: number; attest_rate_per_real_query: number;
+  contributions_community: number; contributions_operator: number; distinct_contributors: number;
+  contributor_keys_issued: number;
+  zero_result_samples: { task: string; t: string }[];
+  real_query_samples: { task: string; domain: string | null; t: string }[];
+}
+
+async function demandMetrics(env: Env): Promise<DemandMetrics> {
+  const events = await loadRecentEvents(env, 1000);
+  let qReal = 0, qPlayground = 0, qZero = 0, attestS = 0, attestF = 0, contribCommunity = 0, contribOperator = 0;
+  const zeroSamples: { task: string; t: string }[] = [];
+  const realSamples: { task: string; domain: string | null; t: string }[] = [];
+  const contributors = new Set<string>();
+  for (const e of events) {
+    const d = e.detail as Record<string, unknown>;
+    if (e.type === "query") {
+      const isPg = d.domain != null && PLAYGROUND_DOMAINS.has(String(d.domain));
+      if (isPg) qPlayground++;
+      else { qReal++; if (realSamples.length < 12) realSamples.push({ task: String(d.task ?? ""), domain: d.domain != null ? String(d.domain) : null, t: e.t }); }
+      if (Number(d.results ?? 0) === 0) { qZero++; if (zeroSamples.length < 15) zeroSamples.push({ task: String(d.task ?? ""), t: e.t }); }
+    } else if (e.type === "attest") {
+      if (d.rejected) continue;
+      if (d.outcome === "success") attestS++; else if (d.outcome === "failure") attestF++;
+    } else if (e.type === "contribute") {
+      if (d.rejected || !d.route_id) continue;
+      if (d.src === "community") contribCommunity++; else contribOperator++;
+      if (d.contributor) contributors.add(String(d.contributor));
+    }
+  }
+  const totalQ = qReal + qPlayground;
+  const attestTotal = attestS + attestF;
+  const keysIssued = parseInt((await env.ROUTES.get("counter:keys")) ?? "0", 10);
+  return {
+    window: "last ≤1000 events (30-day retention)",
+    queries_total: totalQ, queries_real: qReal, queries_playground: qPlayground,
+    queries_zero_result: qZero, zero_result_rate: totalQ ? +(qZero / totalQ).toFixed(3) : 0,
+    attestations: attestTotal, attest_success: attestS, attest_failure: attestF,
+    attest_rate_per_real_query: qReal ? +(attestTotal / qReal).toFixed(3) : 0,
+    contributions_community: contribCommunity, contributions_operator: contribOperator,
+    distinct_contributors: contributors.size, contributor_keys_issued: keysIssued,
+    zero_result_samples: zeroSamples, real_query_samples: realSamples,
+  };
+}
+
+async function demandJsonEndpoint(env: Env): Promise<Response> {
+  const m = await demandMetrics(env);
+  return new Response(JSON.stringify(m, null, 2), { headers: { ...CORS, "Content-Type": "application/json", "Cache-Control": "public, max-age=60" } });
+}
+
+async function demandPageEndpoint(env: Env): Promise<Response> {
+  return new Response(renderDemandPage(await demandMetrics(env)), {
+    headers: { "Content-Type": "text/html;charset=utf-8", "Cache-Control": "public, max-age=60" },
+  });
+}
+
+function renderDemandPage(m: DemandMetrics): string {
+  const card = (label: string, value: string | number, sub: string) =>
+    `<div class="c"><div class="cl">${esc2(label)}</div><div class="cv">${esc2(String(value))}</div><div class="cs">${esc2(sub)}</div></div>`;
+  const zero = m.zero_result_samples.length
+    ? m.zero_result_samples.map((z) => `<li><span class="q">${esc2(z.task)}</span><span class="t">${esc2(z.t.slice(0, 16).replace("T", " "))}</span></li>`).join("")
+    : `<li class="none">No zero-result queries in the window — current coverage answered everything asked.</li>`;
+  const real = m.real_query_samples.length
+    ? m.real_query_samples.map((r) => `<li><span class="q">${esc2(r.task)}</span><span class="dm">${esc2(r.domain ?? "—")}</span></li>`).join("")
+    : `<li class="none">No non-playground queries yet. Every query so far is homepage demo traffic — distribution is the bottleneck, not routes.</li>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Demand — real agent usage | Waymark</title>
+<meta name="robots" content="noindex">
+<style>:root{--bg:#0b0e14;--panel:#131826;--line:#1f2840;--text:#e6ebf4;--dim:#8b96ad;--teal:#5eead4;--indigo:#818cf8;--gold:#fbbf24;--bad:#f87171;--good:#34d399}
+*{box-sizing:border-box;margin:0}body{background:var(--bg);color:var(--text);font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:920px;margin:0 auto;padding:0 24px 70px}
+a{color:var(--teal);text-decoration:none}a:hover{text-decoration:underline}
+nav{display:flex;justify-content:space-between;align-items:center;padding:20px 0;border-bottom:1px solid var(--line)}
+.logo{font-size:20px;font-weight:800;letter-spacing:-.5px;background:linear-gradient(110deg,var(--teal),var(--indigo));-webkit-background-clip:text;background-clip:text;color:transparent}
+nav .lk{color:var(--dim);font-size:14px;margin-left:20px}
+h1{font-size:30px;line-height:1.15;letter-spacing:-1px;margin:34px 0 8px}
+.lede{color:var(--dim);font-size:16px;max-width:680px;margin-bottom:6px}
+.win{color:#5b6880;font-size:12.5px;margin-bottom:26px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-bottom:14px}
+.c{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+.cl{color:var(--dim);font-size:12px;text-transform:uppercase;letter-spacing:.6px}
+.cv{font-size:30px;font-weight:800;margin:6px 0 2px;font-variant-numeric:tabular-nums}
+.cs{color:#5b6880;font-size:12.5px}
+.hl .cv{background:linear-gradient(110deg,var(--teal),var(--indigo));-webkit-background-clip:text;background-clip:text;color:transparent}
+h2{font-size:16px;margin:30px 0 10px;color:var(--text)}
+ul{list-style:none;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:6px 0}
+li{display:flex;justify-content:space-between;gap:14px;padding:9px 18px;border-bottom:1px solid var(--line);font-size:14px}
+li:last-child{border-bottom:0}.q{color:var(--text);font-family:ui-monospace,monospace;font-size:13px}
+.t,.dm{color:var(--dim);font-size:12px;white-space:nowrap}.dm{color:var(--gold);font-family:ui-monospace,monospace}
+.none{color:var(--dim);justify-content:flex-start}
+.note{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--indigo);border-radius:10px;padding:14px 18px;color:var(--dim);font-size:13.5px;margin:24px 0 0}
+.note b{color:var(--text)}
+footer{color:#5b6880;font-size:12.5px;margin-top:34px}</style></head><body>
+<nav><div class="logo">waymark</div><div><a class="lk" href="/dashboard">Network</a><a class="lk" href="/drift">Drift</a><a class="lk" href="/demand.json">JSON</a><a class="lk" href="https://waymark.network">waymark.network</a></div></nav>
+<h1>Demand, not supply.</h1>
+<p class="lede">Route count is a supply metric. These are the numbers that show a network forming: real agent queries, coverage gaps, attestations, and external contributions.</p>
+<p class="win">Window: ${esc2(m.window)}</p>
+<div class="grid">
+${card("Real agent queries", m.queries_real, "excludes homepage playground")}
+${card("Playground queries", m.queries_playground, "homepage demo traffic")}
+${card("Zero-result", `${m.queries_zero_result}`, `${(m.zero_result_rate * 100).toFixed(1)}% of all queries`)}
+</div>
+<div class="grid">
+<div class="c hl"><div class="cl">Attestation rate</div><div class="cv">${m.attest_rate_per_real_query}</div><div class="cs">per real query · ${m.attestations} total (${m.attest_success}✓/${m.attest_failure}✗)</div></div>
+${card("Community routes", m.contributions_community, `${m.distinct_contributors} distinct contributors`)}
+${card("Contributor keys", m.contributor_keys_issued, "issued all-time")}
+</div>
+<h2>Coverage gaps — zero-result queries (what to author next)</h2>
+<ul>${zero}</ul>
+<h2>Real agent queries (non-playground)</h2>
+<ul>${real}</ul>
+<div class="note"><b>Read this as:</b> if real agent queries and attestation rate are near zero while route count climbs, the bottleneck is distribution and the contribution loop — not the map. Grow these, not the counter.</div>
+<footer>Waymark — a service of MC Software, LLC · <a href="/demand.json">JSON feed</a> · internal metrics</footer>
+</body></html>`;
 }
 
 export default {
@@ -637,6 +934,11 @@ export default {
     if (pathname === "/llms.txt") {
       return new Response(LLMS_TXT, { headers: { "Content-Type": "text/plain;charset=utf-8", "Cache-Control": "public, max-age=3600" } });
     }
+    // v0.6 — self-serve contributor keys + demand dashboard
+    if (pathname === "/v1/keys" && request.method === "POST") return issueKeyHttp(env, request);
+    if (pathname === "/admin/revoke-key" && request.method === "POST") return revokeKey(env, request.headers.get("x-write-key"), request);
+    if (pathname === "/demand") return demandPageEndpoint(env);
+    if (pathname === "/demand.json") return demandJsonEndpoint(env);
     return Response.redirect("https://waymark.network", 302);
   },
 };
