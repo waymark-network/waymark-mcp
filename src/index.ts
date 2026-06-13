@@ -42,6 +42,12 @@ interface Route {
   contributor: string;     // contributor handle (never PII from traces)
   created: string;
   attestations: { success: number; failure: number; lastAt: string | null };
+  // Provenance of fact-checking. Lets a consuming agent weight a route:
+  //  - "verified":   individually fact-checked against live docs (per-route)
+  //  - "sampled":    shipped under file-level sampling (some siblings checked, this one rode the heuristic)
+  //  - "unverified": community contribution, not yet checked
+  // Optional for back-compat; absent ⇒ treat as "sampled" (legacy seed default).
+  verification?: { status: "verified" | "sampled" | "unverified"; method?: string; at?: string | null };
 }
 
 type EventType = "query" | "contribute" | "attest";
@@ -63,9 +69,21 @@ const ATTEST_OUTCOME_HOURLY_CAP = 10;
 function logEvent(env: Env, type: EventType, detail: Record<string, unknown>): Promise<void> {
   const t = new Date().toISOString();
   const key = `evt:${t}:${crypto.randomUUID().slice(0, 8)}`;
-  return env.ROUTES.put(key, JSON.stringify({ t, type, detail } satisfies ActivityEvent), {
-    expirationTtl: EVENT_TTL_SECONDS,
-  }).catch(() => {});
+  // Per-day event counter (cnt:evt:YYYY-MM-DD, TTL 32d) so /stats can report
+  // events_30d by summing ≤31 small keys instead of list({prefix:"evt:"}),
+  // which silently caps at 1000 keys. Get→put increment races under
+  // concurrency (KV is not atomic) — same accepted alpha trade-off as
+  // counter:queries; counts are telemetry, not billing.
+  const day = `cnt:evt:${t.slice(0, 10)}`;
+  const bump = env.ROUTES.get(day).then((v) =>
+    env.ROUTES.put(day, String(parseInt(v ?? "0", 10) + 1), { expirationTtl: 60 * 60 * 24 * 32 })
+  );
+  return Promise.all([
+    env.ROUTES.put(key, JSON.stringify({ t, type, detail } satisfies ActivityEvent), {
+      expirationTtl: EVENT_TTL_SECONDS,
+    }),
+    bump,
+  ]).then(() => {}).catch(() => {});
 }
 
 const tokenize = (s: string) =>
@@ -267,6 +285,67 @@ async function mergeIndex(env: Env, key: string | null, request: Request): Promi
   return Response.json({ merged: routes.length, added, updated, missing, index_total: byId.size });
 }
 
+/** WRITE_KEY-gated verification-provenance backfill. Stamps a `verification`
+ * field onto routes that lack one. Two targets, both idempotent (only touch
+ * routes missing the field):
+ *   ?target=routes&cursor=&limit=200  — cursored batch over route:<id> KV values
+ *                                        (source of truth; ≤1 list + N get + N put
+ *                                        per call keeps subrequests well under the
+ *                                        per-request limit — same discipline that
+ *                                        makes full client-side rebuilds unsafe).
+ *   ?target=index                     — one-shot map over idx:routes (the served
+ *                                        copy) so /routes + ranking see the field.
+ * ?status= (default "sampled") & ?method= let the caller stamp legacy routes as
+ * "sampled" while the factory writes "verified"/"unverified" on new ones. */
+async function migrateVerification(env: Env, key: string | null, request: Request): Promise<Response> {
+  if (key !== env.WRITE_KEY) return new Response("forbidden", { status: 403 });
+  const url = new URL(request.url);
+  const target = url.searchParams.get("target") ?? "routes";
+  const status = (url.searchParams.get("status") ?? "sampled") as "verified" | "sampled" | "unverified";
+  const method = url.searchParams.get("method") ?? "legacy-file-sample";
+  const stamp = { status, method, at: new Date().toISOString() };
+
+  if (target === "index") {
+    const idx = await getIndex(env);
+    let stamped = 0;
+    for (const e of idx) { if (!e.verification) { e.verification = stamp; stamped++; } }
+    await env.ROUTES.put(INDEX_KEY, JSON.stringify(idx));
+    return Response.json({ target, total: idx.length, stamped });
+  }
+
+  const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") ?? "200", 10) || 200, 1), 400);
+  const cursor = url.searchParams.get("cursor") || undefined;
+  const page = await env.ROUTES.list({ prefix: "route:", limit, cursor });
+  let stamped = 0, processed = 0;
+  // Parallelize KV gets/puts in chunks (latency-bound, not CPU-bound) so a
+  // 300–400 key batch finishes in seconds rather than tens of seconds.
+  const names = page.keys.map((k) => k.name);
+  const toPut: [string, string][] = [];
+  for (let i = 0; i < names.length; i += 50) {
+    const slice = names.slice(i, i + 50);
+    const raws = await Promise.all(slice.map((n) => env.ROUTES.get(n)));
+    for (let j = 0; j < slice.length; j++) {
+      const raw = raws[j];
+      if (!raw) continue;
+      processed++;
+      const r: Route = JSON.parse(raw);
+      if (!r.verification) {
+        r.verification = stamp;
+        toPut.push([slice[j], JSON.stringify(r)]);
+        stamped++;
+      }
+    }
+  }
+  for (let i = 0; i < toPut.length; i += 50) {
+    await Promise.all(toPut.slice(i, i + 50).map(([n, v]) => env.ROUTES.put(n, v)));
+  }
+  return Response.json({
+    target, processed, stamped,
+    cursor: page.list_complete ? null : page.cursor,
+    done: page.list_complete,
+  });
+}
+
 export class WaymarkMCP extends McpAgent<Env> {
   server = new McpServer({ name: "waymark", version: "0.2.0" });
 
@@ -310,6 +389,7 @@ export class WaymarkMCP extends McpAgent<Env> {
                 ? r.attestations.success / (r.attestations.success + r.attestations.failure)
                 : null,
             attestation_count: r.attestations.success + r.attestations.failure,
+            verification: r.verification ?? { status: "sampled", method: "legacy-file-sample" },
           }));
         await Promise.all([
           counterWrite,
@@ -362,10 +442,13 @@ export class WaymarkMCP extends McpAgent<Env> {
           return { content: [{ type: "text" as const, text: "Rejected: submission appears to contain credentials/secrets. Sanitize and resubmit procedure-only content." }], isError: true };
         }
         const id = crypto.randomUUID();
+        const nowIso = new Date().toISOString();
         const route: Route = {
           id, task, domain, steps, gotchas, contributor,
-          created: new Date().toISOString(),
+          created: nowIso,
           attestations: { success: 0, failure: 0, lastAt: null },
+          // Community contributions are unverified until the canary/factory checks them.
+          verification: { status: "unverified", method: "community-contrib", at: nowIso },
         };
         await env.ROUTES.put(`route:${id}`, JSON.stringify(route));
         await patchIndex(env, (idx) => [...idx, route]);
@@ -512,6 +595,12 @@ export default {
       const limit = Math.min(parseInt(searchParams.get("limit") ?? "100", 10) || 100, 500);
       return activityEndpoint(env, limit);
     }
+    if (pathname === "/freshness") return freshnessEndpoint(env);
+    if (pathname === "/drift") return driftEndpoint(env, false);
+    if (pathname === "/drift.json") return driftEndpoint(env, true);
+    if (pathname === "/admin/drift" && request.method === "POST") {
+      return recordDrift(env, request);
+    }
     if (pathname === "/dashboard") {
       return new Response(DASHBOARD_HTML, {
         headers: { "Content-Type": "text/html;charset=utf-8", "Cache-Control": "public, max-age=300" },
@@ -527,11 +616,17 @@ export default {
     if (pathname === "/admin/backfill-vectors" && request.method === "POST") {
       return backfillVectors(env, request.headers.get("x-write-key"), searchParams.get("since"));
     }
+    if (pathname === "/admin/migrate-verification" && request.method === "POST") {
+      return migrateVerification(env, request.headers.get("x-write-key"), request);
+    }
     if (pathname === "/admin/vec-debug") {
       return vecDebug(env, searchParams.get("q") ?? "", request.headers.get("x-write-key"));
     }
     if (pathname.startsWith("/r/")) {
-      return routePage(env, pathname.slice(3));
+      const rest = pathname.slice(3);
+      // /r/{id}.json → machine-readable full route record (item 10).
+      if (rest.endsWith(".json")) return routeJson(request, env, rest.slice(0, -5));
+      return routePage(env, rest);
     }
     if (pathname === "/sitemap.xml") return sitemap(env);
     if (pathname === "/robots.txt") {
@@ -552,7 +647,13 @@ async function stats(request: Request, env: Env): Promise<Response> {
     const routes = await getIndex(env);
     const attestations = routes.reduce((n, r) => n + r.attestations.success + r.attestations.failure, 0);
     const queries = parseInt((await env.ROUTES.get("counter:queries")) ?? "0", 10);
-    const events = (await env.ROUTES.list({ prefix: "evt:", limit: 1000 })).keys.length;
+    // Counter-based events_30d: sum ≤31 per-day counters (see logEvent).
+    // Replaces list({prefix:"evt:"}) which capped the stat at 1000 forever.
+    const dayKeys = (await env.ROUTES.list({ prefix: "cnt:evt:", limit: 100 })).keys.map((k) => k.name);
+    const cutoff = new Date(Date.now() - 30 * 86400_000).toISOString().slice(0, 10);
+    const recent = dayKeys.filter((k) => k.slice(8) >= cutoff);
+    const vals = await Promise.all(recent.map((k) => env.ROUTES.get(k)));
+    const events = vals.reduce((n, v) => n + (parseInt(v ?? "0", 10) || 0), 0);
     const body = JSON.stringify({ routes: routes.length, attestations, queries, events_30d: events });
     return conditional(request, body, await etagOf(body), {
       ...CORS, "Content-Type": "application/json", "Cache-Control": "public, max-age=60",
@@ -562,8 +663,150 @@ async function stats(request: Request, env: Env): Promise<Response> {
   }
 }
 
-/** Full route table for the dashboard (CORS-open, ETag revalidation). */
+/* ---------------- API Drift Tracker ----------------
+ * The canary detects when a real API changes and breaks a documented route.
+ * Those drift events are recorded (KV key drift:<iso>:<rand>) and published
+ * at /drift as JSON + a human page — "the changelog of how the API world
+ * shifts under AI agents." Recurring, useful, shareable demand engine. */
+interface DriftEvent { t: string; domain: string; api: string; what: string; impact: string; route_id?: string; fix?: string; source: string }
+
+async function recordDrift(env: Env, request: Request): Promise<Response> {
+  const key = request.headers.get("x-write-key");
+  if (key !== env.WRITE_KEY) return new Response("forbidden", { status: 403 });
+  let d: Partial<DriftEvent>;
+  try { d = await request.json(); } catch { return new Response("bad json", { status: 400 }); }
+  if (!d.domain || !d.what) return new Response("domain+what required", { status: 400 });
+  const ev: DriftEvent = {
+    t: new Date().toISOString(), domain: String(d.domain), api: String(d.api ?? d.domain),
+    what: String(d.what).slice(0, 400), impact: String(d.impact ?? "agents on stale knowledge may break").slice(0, 300),
+    route_id: d.route_id ? String(d.route_id) : undefined, fix: d.fix ? String(d.fix).slice(0, 400) : undefined,
+    source: String(d.source ?? "canary"),
+  };
+  await env.ROUTES.put(`drift:${ev.t}:${crypto.randomUUID().slice(0, 8)}`, JSON.stringify(ev), { expirationTtl: 60 * 60 * 24 * 365 });
+  return Response.json({ recorded: true });
+}
+
+async function loadDrift(env: Env, limit = 100): Promise<DriftEvent[]> {
+  const list = await env.ROUTES.list({ prefix: "drift:", limit: 1000 });
+  const keys = list.keys.map((k) => k.name).sort().reverse().slice(0, limit);
+  const vals = await Promise.all(keys.map((k) => env.ROUTES.get(k)));
+  return vals.filter((v): v is string => v !== null).map((v) => JSON.parse(v));
+}
+
+async function driftEndpoint(env: Env, asJson: boolean): Promise<Response> {
+  const events = await loadDrift(env, 200);
+  if (asJson) {
+    return Response.json({ count: events.length, drift: events }, { headers: { ...CORS, "Cache-Control": "public, max-age=600" } });
+  }
+  return new Response(driftPage(events), { headers: { "Content-Type": "text/html;charset=utf-8", "Cache-Control": "public, max-age=600" } });
+}
+
+const esc2 = (s: string) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] as string));
+function driftPage(events: DriftEvent[]): string {
+  const rows = events.map((e) => {
+    const day = e.t.slice(0, 10);
+    return `<div class="d">
+      <div class="dh"><span class="dom">${esc2(e.domain)}</span><span class="dt">${day}</span></div>
+      <div class="what">${esc2(e.what)}</div>
+      <div class="impact">⚠ ${esc2(e.impact)}</div>
+      ${e.fix ? `<div class="fix">✓ Fixed route: ${esc2(e.fix)}${e.route_id ? ` · <a href="/r/${esc2(e.route_id)}">view route</a>` : ""}</div>` : ""}
+      <div class="src">detected by ${esc2(e.source)}</div>
+    </div>`;
+  }).join("");
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>API Drift Tracker — when the API world shifts under AI agents | Waymark</title>
+<meta name="description" content="Live tracker of real API changes that silently break AI agents running on stale knowledge — detected by Waymark's canary fleet re-verifying routes against live APIs.">
+<meta property="og:title" content="API Drift Tracker — APIs that just broke your AI agents">
+<meta property="og:description" content="Waymark re-verifies thousands of API routes against live endpoints. When an API changes and breaks agents on stale knowledge, it shows up here first.">
+<meta property="og:type" content="website"><meta name="twitter:card" content="summary_large_image">
+<link rel="canonical" href="https://mcp.waymark.network/drift">
+<style>:root{--bg:#0b0e14;--panel:#131826;--line:#1f2840;--text:#e6ebf4;--dim:#8b96ad;--teal:#5eead4;--indigo:#818cf8;--gold:#fbbf24;--bad:#f87171;--good:#34d399}
+*{box-sizing:border-box;margin:0}body{background:var(--bg);color:var(--text);font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:820px;margin:0 auto;padding:0 24px 70px}
+a{color:var(--teal);text-decoration:none}a:hover{text-decoration:underline}
+nav{display:flex;justify-content:space-between;align-items:center;padding:20px 0;border-bottom:1px solid var(--line)}
+.logo{font-size:20px;font-weight:800;letter-spacing:-.5px;background:linear-gradient(110deg,var(--teal),var(--indigo));-webkit-background-clip:text;background-clip:text;color:transparent}
+nav .lk{color:var(--dim);font-size:14px;margin-left:20px}
+h1{font-size:34px;line-height:1.15;letter-spacing:-1px;margin:40px 0 12px}
+h1 em{font-style:normal;background:linear-gradient(110deg,var(--teal),var(--indigo));-webkit-background-clip:text;background-clip:text;color:transparent}
+.lede{color:var(--dim);font-size:18px;max-width:640px;margin-bottom:10px}
+.how{color:var(--dim);font-size:14px;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 18px;margin:22px 0 30px}
+.how b{color:var(--text)}
+.d{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--gold);border-radius:10px;padding:16px 18px;margin:12px 0}
+.dh{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px}
+.dom{font-weight:700;color:var(--gold);font-family:ui-monospace,monospace;font-size:14px}
+.dt{color:var(--dim);font-size:12px;font-family:ui-monospace,monospace}
+.what{color:var(--text);margin:4px 0}.impact{color:#f3c969;font-size:14px;margin:6px 0}
+.fix{color:var(--good);font-size:14px;margin-top:6px}.src{color:#5b6880;font-size:11px;margin-top:8px;text-transform:uppercase;letter-spacing:.6px}
+.empty{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:28px;text-align:center;color:var(--dim)}
+.cta{margin-top:34px;background:linear-gradient(135deg,#0f2419,#0a1a24);border:1px solid rgba(94,234,212,.25);border-radius:14px;padding:26px}
+.cta h2{font-size:19px;margin-bottom:8px}.cta code{display:block;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px 14px;font-family:ui-monospace,monospace;font-size:13px;color:var(--teal);margin-top:12px;overflow-x:auto}
+footer{color:#5b6880;font-size:12.5px;margin-top:40px}</style></head><body>
+<nav><div class="logo">waymark</div><div><a class="lk" href="/dashboard">Live dashboard</a><a class="lk" href="https://waymark.network/benchmark">Benchmark</a><a class="lk" href="https://waymark.network">waymark.network</a></div></nav>
+<h1>The API world shifts under your agents. <em>Here's the changelog.</em></h1>
+<p class="lede">APIs change constantly — endpoints deprecate, auth models shift, required fields appear. AI agents running on training-cutoff knowledge break silently. Waymark re-verifies thousands of API routes against live endpoints every day; when something drifts, it surfaces here first.</p>
+<div class="how"><b>How this works:</b> Waymark's canary fleet re-executes documented API routes against the real, live APIs. When a previously-working route is rejected by the live service — a deprecated endpoint, a changed parameter, a new requirement — that's <b>drift</b>, and your agents are about to fail on it. We log it, fix the route, and publish it here.</div>
+${events.length ? rows : `<div class="empty">No drift detected in the current window — every re-verified route still matches its live API. The canary runs daily; changes will appear here as they're caught.</div>`}
+<div class="cta"><h2>Stop your agents from running on stale API knowledge</h2>
+<p style="color:var(--dim);font-size:14px">Waymark gives any agent live, verified routes — the current way to call every API, with the gotchas that just changed. One MCP install:</p>
+<code>claude mcp add --transport http waymark https://mcp.waymark.network/mcp</code></div>
+<footer>Waymark — the shared, self-verifying route map for AI agents · a service of MC Software, LLC · <a href="/drift.json">JSON feed</a></footer>
+</body></html>`;
+}
+
+/** Freshness / decay scoring across the whole corpus.
+ * Trust isn't just success rate — a route verified yesterday is worth more than
+ * one untouched for a year. freshness_factor decays with time since last
+ * attestation (half-life 60 days); decayed_trust = laplace_trust × freshness.
+ * Surfaces stalest routes so the canary/factory re-verify the right ones. */
+async function freshnessEndpoint(env: Env): Promise<Response> {
+  const routes = await getIndex(env);
+  const now = Date.now();
+  const HALF_LIFE_MS = 60 * 86400_000;
+  const ageDays = (iso: string | null, created: string) =>
+    (now - new Date(iso ?? created).getTime()) / 86400_000;
+  let fresh = 0, aging = 0, stale = 0, never = 0;
+  const scored = routes.map((r) => {
+    const a = r.attestations;
+    const total = a.success + a.failure;
+    const laplace = (a.success + 1) / (total + 2);
+    const refIso = a.lastAt;
+    const days = ageDays(refIso, r.created);
+    const freshness = Math.pow(0.5, (now - new Date(refIso ?? r.created).getTime()) / HALF_LIFE_MS);
+    if (total === 0) never++;
+    else if (days <= 30) fresh++;
+    else if (days <= 90) aging++;
+    else stale++;
+    return {
+      id: r.id, task: r.task, domain: r.domain,
+      attestations: total, last_days: Math.round(days),
+      trust: Math.round(laplace * 100) / 100,
+      freshness: Math.round(freshness * 100) / 100,
+      decayed_trust: Math.round(laplace * freshness * 100) / 100,
+      never_attested: total === 0,
+    };
+  });
+  // Stalest-first priority queue: attested routes, oldest last_days, then lowest decayed_trust.
+  const priority = scored
+    .filter((s) => !s.never_attested)
+    .sort((a, b) => b.last_days - a.last_days || a.decayed_trust - b.decayed_trust)
+    .slice(0, 50);
+  const body = JSON.stringify({
+    total: routes.length,
+    buckets: { fresh, aging, stale, never_attested: never },
+    half_life_days: 60,
+    reverify_priority: priority,
+  });
+  return new Response(body, { headers: { ...CORS, "Content-Type": "application/json", "Cache-Control": "public, max-age=300" } });
+}
+
+/** Route table JSON (CORS-open, ETag revalidation).
+ * Paginated by default (item 6b): ?page=&per_page=&domain= — the payload hit
+ * 1.29 MB at ~4k routes and was growing ~100/h, so unbounded-by-default had
+ * to go. `?all=1` keeps the legacy full payload for the dashboard (its table
+ * + domain chips need every row). Sort order is identical in both modes, so
+ * page-1 consumers (homepage top-6, smoke sample id) see unchanged data. */
 async function routesEndpoint(request: Request, env: Env): Promise<Response> {
+  const { searchParams } = new URL(request.url);
   const routes = await getIndex(env);
   const rows = routes
     .map((r) => ({
@@ -581,9 +824,27 @@ async function routesEndpoint(request: Request, env: Env): Promise<Response> {
           ? r.attestations.success / (r.attestations.success + r.attestations.failure)
           : null,
       last_attested: r.attestations.lastAt,
+      verification: r.verification?.status ?? "sampled",
     }))
     .sort((a, b) => (b.success + b.failure) - (a.success + a.failure));
-  const body = JSON.stringify({ routes: rows });
+  let body: string;
+  if (searchParams.get("all") === "1" || searchParams.get("all") === "true") {
+    body = JSON.stringify({ routes: rows }); // legacy full payload (dashboard)
+  } else {
+    const domain = (searchParams.get("domain") ?? "").trim().toLowerCase();
+    const filtered = domain ? rows.filter((r) => r.domain.toLowerCase() === domain) : rows;
+    const perPage = Math.min(Math.max(parseInt(searchParams.get("per_page") ?? "100", 10) || 100, 1), 500);
+    const pages = Math.max(Math.ceil(filtered.length / perPage), 1);
+    const page = Math.min(Math.max(parseInt(searchParams.get("page") ?? "1", 10) || 1, 1), pages);
+    body = JSON.stringify({
+      routes: filtered.slice((page - 1) * perPage, page * perPage),
+      total: filtered.length,
+      page,
+      per_page: perPage,
+      pages,
+      ...(domain ? { domain } : {}),
+    });
+  }
   // Vary: Accept — /routes is content-negotiated (HTML browse page vs JSON);
   // shared caches must not serve one representation for the other.
   return conditional(request, body, await etagOf(body), {
@@ -607,6 +868,7 @@ async function searchEndpoint(env: Env, q: string, ctx: ExecutionContext): Promi
       id: r.id, task: r.task, domain: r.domain,
       steps: r.steps, gotchas: r.gotchas,
       success: r.attestations.success, failure: r.attestations.failure,
+      verification: r.verification ?? { status: "sampled", method: "legacy-file-sample" },
       url: `https://mcp.waymark.network/r/${r.id}`,
     }));
   ctx.waitUntil(logEvent(env, "query", { task: q.slice(0, 140), domain: "web-playground", results: ranked.length, ms: retrievalMs }));
@@ -716,6 +978,41 @@ const escapeHtml = (s: string) =>
   s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] as string));
 
 /** SEO page per route: server-rendered HTML + HowTo structured data. */
+/** Per-route JSON for programmatic consumers (item 10). Returns the FULL route
+ * record — complete steps/gotchas/attestations — unlike /routes' summary rows.
+ * CORS-open, ETag-revalidated (matches /r/{id} HTML's 300s cache), 404 for
+ * unknown ids. Stable schema: id, task, domain, steps[], gotchas[], contributor,
+ * created, attestations{success,failure,last_attested}, success_rate, url. */
+async function routeJson(request: Request, env: Env, id: string): Promise<Response> {
+  if (!/^[0-9a-f-]{36}$/.test(id)) {
+    return Response.json({ error: "not_found", id }, { status: 404, headers: CORS });
+  }
+  const raw = await env.ROUTES.get(`route:${id}`);
+  if (!raw) return Response.json({ error: "not_found", id }, { status: 404, headers: CORS });
+  const r: Route = JSON.parse(raw);
+  const total = r.attestations.success + r.attestations.failure;
+  const body = JSON.stringify({
+    id: r.id,
+    task: r.task,
+    domain: r.domain,
+    steps: r.steps,
+    gotchas: r.gotchas,
+    contributor: r.contributor,
+    created: r.created,
+    attestations: {
+      success: r.attestations.success,
+      failure: r.attestations.failure,
+      last_attested: r.attestations.lastAt,
+    },
+    success_rate: total > 0 ? r.attestations.success / total : null,
+    verification: r.verification ?? { status: "sampled", method: "legacy-file-sample" },
+    url: `https://mcp.waymark.network/r/${r.id}`,
+  });
+  return conditional(request, body, await etagOf(body), {
+    ...CORS, "Content-Type": "application/json", "Cache-Control": "public, max-age=300",
+  });
+}
+
 async function routePage(env: Env, id: string): Promise<Response> {
   if (!/^[0-9a-f-]{36}$/.test(id)) return new Response("Not found", { status: 404 });
   const raw = await env.ROUTES.get(`route:${id}`);
@@ -787,7 +1084,7 @@ ${related.length ? `<div class="panel rel"><h2>Related routes</h2>${related.map(
 <div class="panel cta"><h2>Give your agent this knowledge — and 200+ more routes</h2>
 One MCP install gives any agent live access to the full route map, with trust scores updated by agent consensus:
 <code>claude mcp add --transport http waymark https://mcp.waymark.network/mcp</code></div>
-<footer>Waymark — the shared route map of the agent economy · <a href="https://mcp.waymark.network/dashboard">live dashboard</a> · <a href="https://waymark.network/benchmark">benchmark</a></footer>
+<footer>Waymark — the shared route map of the agent economy · <a href="https://mcp.waymark.network/dashboard">live dashboard</a> · <a href="https://waymark.network/benchmark">benchmark</a> · <a href="${pageUrl}.json">this route as JSON</a></footer>
 </body></html>`;
   return new Response(html, { headers: { "Content-Type": "text/html;charset=utf-8", "Cache-Control": "public, max-age=300" } });
 }
@@ -984,6 +1281,17 @@ footer a{color:var(--teal);text-decoration:none}
 <h2 id="sec-pulse">Network pulse — last 24 hours</h2>
 <div class="panel" id="pulseWrap"><canvas id="pulse"></canvas></div>
 
+<h2 id="sec-canary">Freshness — canary re-verifications <span style="font-size:11px;color:var(--dim);text-transform:none;letter-spacing:0">routes re-driven against live APIs, kept green</span></h2>
+<div class="panel" style="padding:16px 18px">
+  <div style="display:flex;gap:22px;flex-wrap:wrap;margin-bottom:12px">
+    <div><span id="cn-pass" style="font-size:26px;font-weight:800;color:var(--good);font-family:'JetBrains Mono',monospace">0</span> <span class="dim" style="font-size:12px">verified live</span></div>
+    <div><span id="cn-fail" style="font-size:26px;font-weight:800;color:var(--bad);font-family:'JetBrains Mono',monospace">0</span> <span class="dim" style="font-size:12px">drift caught</span></div>
+    <div style="flex:1"></div>
+    <div class="dim" style="font-size:12px;max-width:340px;text-align:right">The canary fleet re-runs popular routes against live sandbox APIs daily and attests the result — the "drive the highways at 3am" freshness layer.</div>
+  </div>
+  <div id="canaryFeed"><span class="dim">No canary runs in the window yet — the fleet runs daily (and on demand).</span></div>
+</div>
+
 <h2 id="sec-feed">Live agent activity</h2>
 <div class="panel feedScroll"><table id="feed"><thead><tr><th style="width:150px">When</th><th style="width:130px">Event</th><th>Detail</th></tr></thead><tbody></tbody></table></div>
 
@@ -1175,7 +1483,7 @@ function load(){
   Promise.all([
     fetch("https://mcp.waymark.network/stats").then(function(x){return x.json()}),
     fetch("https://mcp.waymark.network/activity?limit=120").then(function(x){return x.json()}),
-    fetch("https://mcp.waymark.network/routes").then(function(x){return x.json()})
+    fetch("https://mcp.waymark.network/routes?all=1").then(function(x){return x.json()})
   ]).then(function(res){
     var s=res[0],a=res[1],r=res[2];
 
@@ -1205,6 +1513,20 @@ function load(){
       feedBody.innerHTML=html;
       lastEventIds=newIds;
     }
+
+    /* Canary freshness — attest events tagged note:"canary" */
+    var canary=a.events.filter(function(e){return e.type==="attest"&&e.detail&&typeof e.detail.note==="string"&&e.detail.note.toLowerCase().indexOf("canary")>=0;});
+    var cpass=canary.filter(function(e){return e.detail.outcome==="success";}).length;
+    var cfail=canary.filter(function(e){return e.detail.outcome==="failure";}).length;
+    $("cn-pass").textContent=cpass;$("cn-fail").textContent=cfail;
+    $("canaryFeed").innerHTML=canary.length?canary.slice(0,12).map(function(e){
+      var ok=e.detail.outcome==="success";
+      return "<div style='display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid rgba(31,40,64,.5)'>"+
+        "<span style='width:9px;height:9px;border-radius:50%;flex:0 0 auto;background:"+(ok?"var(--good)":"var(--bad)")+";box-shadow:0 0 8px "+(ok?"rgba(52,211,153,.6)":"rgba(248,113,113,.6)")+"'></span>"+
+        "<span style='flex:1'>"+esc(e.detail.task||e.detail.route_id||"route")+"</span>"+
+        "<span class='mono' style='font-size:12px;color:"+(ok?"var(--good)":"var(--bad)")+"'>"+(ok?"verified":"drift")+"</span>"+
+        "<span class='dim mono' style='font-size:11px'>"+ago(e.t)+"</span></div>";
+    }).join(""):"<span class='dim'>No canary runs in the window yet — the fleet runs daily (and on demand).</span>";
 
     /* Routes table — clickable rows linking to /r/{id} */
     $("routes").tBodies[0].innerHTML=r.routes.map(function(x){
