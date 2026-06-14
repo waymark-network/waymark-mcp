@@ -2081,10 +2081,19 @@ function load(){
       domTop.map(function(d){return '<span class="fchip'+(d===activeDomain?" active":"")+'" data-d="'+esc(d)+'">'+esc(d)+'<span class="ct">'+domCounts[d]+'</span></span>'}).join("");
     applyDomainFilter();
 
-    /* Demand map — top queried domains + zero-result queries from /activity */
-    var qevents=a.events.filter(function(e){return e.type==="query"&&e.detail});
+    /* Demand map — top queried domains + zero-result queries from /activity.
+       Synthetic-traffic exclusion MIRRORS the worker's isSyntheticTraffic (~line 761)
+       and the homepage's isRealDemand so all three surfaces report identical real
+       demand: drop web-playground/playground demo traffic and .invalid/example-e2e
+       e2e probes; a null/empty domain stays REAL (a domain-less agent query is a
+       legitimate coverage gap, e.g. "rotate an AWS IAM key"). Filtering at the
+       source guarantees BOTH the domain map and the zero-result list below exclude
+       synthetic traffic — so the dashboard can no longer show "purple monkey
+       dishwasher" as a coverage gap (the pollution item 11 removed from /demand). */
+    function dmSynthetic(domain){if(domain==null)return false;var d=String(domain).toLowerCase();return d==="web-playground"||d==="playground"||d.indexOf(".invalid")>=0||d.indexOf("example-e2e")>=0;}
+    var qevents=a.events.filter(function(e){return e.type==="query"&&e.detail&&!dmSynthetic(e.detail.domain)});
     var dcounts={};
-    qevents.forEach(function(e){var d=e.detail.domain;if(d&&d!=="web-playground")dcounts[d]=(dcounts[d]||0)+1});
+    qevents.forEach(function(e){var d=e.detail.domain;if(d)dcounts[d]=(dcounts[d]||0)+1});
     var dtop=Object.keys(dcounts).map(function(k){return[k,dcounts[k]]}).sort(function(p,q){return q[1]-p[1]}).slice(0,8);
     var dmax=dtop.length?dtop[0][1]:1;
     $("dm-domains").innerHTML=dtop.length
