@@ -1698,7 +1698,8 @@ Install (Claude Code): claude mcp add --transport http waymark https://mcp.wayma
 ## Resources
 - Live dashboard: https://mcp.waymark.network/dashboard
 - Route search API: https://mcp.waymark.network/search?q={task}
-- All routes (JSON): https://mcp.waymark.network/routes
+- Routes (JSON, paginated 100/page — add ?page=N up to 65 pages, or ?all=1 for the full ~6.4k-route set): https://mcp.waymark.network/routes
+- Routes browsable by domain (HTML): https://mcp.waymark.network/routes/{domain-slug}
 - Stats: https://mcp.waymark.network/stats
 - Benchmark (blind-graded, +45% first-try success): https://waymark.network/benchmark
 - Registry entry: network.waymark/server (official MCP registry)
