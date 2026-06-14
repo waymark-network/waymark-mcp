@@ -1582,7 +1582,25 @@ async function routePage(env: Env, id: string): Promise<Response> {
   const r: Route = JSON.parse(raw);
   const t = escapeHtml(r.task), d = escapeHtml(r.domain);
   const total = r.attestations.success + r.attestations.failure;
-  const trust = total > 0 ? Math.round((r.attestations.success / total) * 100) + "% verified" : "unrated";
+  const attestPct = total > 0 ? Math.round((r.attestations.success / total) * 100) : null;
+
+  // Two independent trust axes — surface BOTH honestly, never conflate them:
+  //  1. provenance: how the route was vetted before serving (verified/sampled/unverified)
+  //  2. attestation consensus: outcomes agents reported after running it.
+  // A bare attestation % is NOT "verification" — and a community route must never be
+  // titled "verified" (the codebase earns that word; see the contribute path). Legacy
+  // seed routes carry no stamp ⇒ "sampled" (matches the index back-compat convention).
+  const vStatus = r.verification?.status ?? "sampled";
+  const vWord = vStatus === "verified" ? "verified" : vStatus === "unverified" ? "community-contributed" : "sampled";
+  const vProvenance = vStatus === "verified"
+    ? "Verified — individually fact-checked against live docs"
+    : vStatus === "unverified"
+    ? "Community-contributed — not yet independently checked"
+    : "Sampled — shipped under file-level sampling, not individually fact-checked";
+  const titleKind = vStatus === "verified" ? "verified agent route" : vStatus === "unverified" ? "community agent route" : "agent route";
+  const descKind = vStatus === "verified" ? "Verified procedural route" : vStatus === "unverified" ? "Community-contributed procedural route" : "Procedural route";
+  const stepsHeading = vStatus === "verified" ? "Verified steps" : vStatus === "unverified" ? "Documented steps" : "Steps";
+  const attestSummary = total > 0 ? `${attestPct}% success across ${total} agent attestation${total === 1 ? "" : "s"}` : "no community attestations yet";
 
   // Related routes: semantic neighbors of this route's task (self excluded).
   let related: Route[] = [];
@@ -1590,7 +1608,7 @@ async function routePage(env: Env, id: string): Promise<Response> {
     related = (await retrieve(env, r.task, undefined, 4)).filter((x) => x.id !== r.id).slice(0, 3);
   } catch { /* page renders fine without */ }
 
-  const desc = `Verified procedural route for: ${t}. ${r.steps.length} steps, ${r.gotchas.length} known gotchas, ${trust}. From the Waymark agent knowledge network.`;
+  const desc = `${descKind} for: ${t}. ${r.steps.length} steps, ${r.gotchas.length} known gotchas. Provenance: ${vWord}; ${attestSummary}. From the Waymark agent knowledge network.`;
   const pageUrl = `https://mcp.waymark.network/r/${r.id}`;
   const jsonLd = {
     "@context": "https://schema.org", "@type": "HowTo", name: r.task,
@@ -1608,22 +1626,28 @@ async function routePage(env: Env, id: string): Promise<Response> {
   };
   const html = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${t} — verified agent route | Waymark</title>
+<title>${t} — ${titleKind} | Waymark</title>
 <meta name="description" content="${desc}">
 <link rel="canonical" href="${pageUrl}">
 <meta property="og:type" content="article">
 <meta property="og:site_name" content="Waymark">
-<meta property="og:title" content="${t} — verified agent route">
+<meta property="og:title" content="${t} — ${titleKind}">
 <meta property="og:description" content="${desc}">
 <meta property="og:url" content="${pageUrl}">
 <meta name="twitter:card" content="summary">
-<meta name="twitter:title" content="${t} — verified agent route | Waymark">
+<meta name="twitter:title" content="${t} — ${titleKind} | Waymark">
 <meta name="twitter:description" content="${desc}">
 <script type="application/ld+json">${JSON.stringify(jsonLd)}</script>
 <script type="application/ld+json">${JSON.stringify(breadcrumbLd)}</script>
 <style>:root{--bg:#0b0e14;--panel:#131826;--line:#1f2840;--text:#e6ebf4;--dim:#8b96ad;--accent:#5eead4;--warn:#fbbf24;--good:#34d399}
 *{box-sizing:border-box;margin:0}body{background:var(--bg);color:var(--text);font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:760px;margin:0 auto;padding:24px}
-a{color:var(--accent)}h1{font-size:26px;line-height:1.3;margin:18px 0 6px}.meta{color:var(--dim);font-size:14px;margin-bottom:24px}
+a{color:var(--accent)}h1{font-size:26px;line-height:1.3;margin:18px 0 6px}.meta{color:var(--dim);font-size:14px;margin-bottom:10px}
+.vbadge{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;font-size:13px;margin-bottom:24px}
+.vbadge .vp{font-weight:600;padding:3px 11px;border-radius:99px;border:1px solid var(--line)}
+.vbadge .va{color:var(--dim)}
+.v-verified .vp{color:var(--good);border-color:var(--good)}
+.v-sampled .vp{color:var(--accent);border-color:var(--accent)}
+.v-unverified .vp{color:var(--warn);border-color:var(--warn)}
 .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px 24px;margin:16px 0}
 h2{font-size:13px;text-transform:uppercase;letter-spacing:1.2px;color:var(--accent);margin-bottom:12px}
 ol,ul{padding-left:22px}li{margin:8px 0}.g li{color:var(--warn)}
@@ -1635,12 +1659,13 @@ footer{color:var(--dim);font-size:13px;margin-top:28px}
 .rel .rt{font-weight:600}.rel .rm{color:var(--dim);font-size:12.5px;margin-top:2px}</style></head><body>
 <nav class="crumbs" aria-label="Breadcrumb"><a href="https://waymark.network">Waymark</a><span class="sep">/</span><a href="https://mcp.waymark.network/routes">Routes</a><span class="sep">/</span><a href="https://mcp.waymark.network/routes/${domainSlug(r.domain)}">${d}</a></nav>
 <h1>${t}</h1>
-<div class="meta">domain: <b>${d}</b> · ${r.steps.length} steps · trust: ${trust} (${r.attestations.success}✓ / ${r.attestations.failure}✗) · contributed by ${escapeHtml(r.contributor)}</div>
-<div class="panel"><h2>Verified steps</h2><ol>${r.steps.map((s) => `<li>${escapeHtml(s)}</li>`).join("")}</ol></div>
+<div class="meta">domain: <b>${d}</b> · ${r.steps.length} steps · contributed by ${escapeHtml(r.contributor)}</div>
+<div class="vbadge v-${vStatus}"><span class="vp">${vProvenance}</span><span class="va">community attestations: ${r.attestations.success}✓ / ${r.attestations.failure}✗${attestPct !== null ? ` · ${attestPct}% success` : ""}</span></div>
+<div class="panel"><h2>${stepsHeading}</h2><ol>${r.steps.map((s) => `<li>${escapeHtml(s)}</li>`).join("")}</ol></div>
 ${r.gotchas.length ? `<div class="panel g"><h2>Known gotchas</h2><ul>${r.gotchas.map((g) => `<li>${escapeHtml(g)}</li>`).join("")}</ul></div>` : ""}
 ${related.length ? `<div class="panel rel"><h2>Related routes</h2>${related.map((x) => {
     const xt = x.attestations.success + x.attestations.failure;
-    const xtrust = xt > 0 ? Math.round((x.attestations.success / xt) * 100) + "% verified" : "unrated";
+    const xtrust = xt > 0 ? Math.round((x.attestations.success / xt) * 100) + "% success" : "unrated";
     return `<a href="/r/${x.id}"><div class="rt">${escapeHtml(x.task)}</div><div class="rm">${escapeHtml(x.domain)} · ${x.steps.length} steps · ${xtrust}</div></a>`;
   }).join("")}</div>` : ""}
 <div class="panel cta"><h2>Give your agent this knowledge — and 200+ more routes</h2>
