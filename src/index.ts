@@ -752,6 +752,18 @@ async function revokeKey(env: Env, adminKey: string | null, request: Request): P
 
 const PLAYGROUND_DOMAINS = new Set(["web-playground", "playground"]);
 
+/** Synthetic / non-organic query traffic that must never count as real demand
+ *  or as a coverage gap: homepage playground demo + smoke-suite probes (both
+ *  logged under "web-playground", incl. the intentional `purple monkey
+ *  dishwasher` zero-result probe) and e2e loop-test traffic (domains like
+ *  "example-e2e.invalid"). Mirrors the homepage's isRealDemand() filter so the
+ *  landing page and /demand agree on what counts as real demand. */
+function isSyntheticTraffic(domain: string | null): boolean {
+  if (domain == null) return false;
+  const d = domain.toLowerCase();
+  return PLAYGROUND_DOMAINS.has(d) || d.includes(".invalid") || d.includes("example-e2e");
+}
+
 interface DemandMetrics {
   window: string;
   queries_total: number; queries_real: number; queries_playground: number;
@@ -772,10 +784,17 @@ async function demandMetrics(env: Env): Promise<DemandMetrics> {
   for (const e of events) {
     const d = e.detail as Record<string, unknown>;
     if (e.type === "query") {
-      const isPg = d.domain != null && PLAYGROUND_DOMAINS.has(String(d.domain));
-      if (isPg) qPlayground++;
-      else { qReal++; if (realSamples.length < 12) realSamples.push({ task: String(d.task ?? ""), domain: d.domain != null ? String(d.domain) : null, t: e.t }); }
-      if (Number(d.results ?? 0) === 0) { qZero++; if (zeroSamples.length < 15) zeroSamples.push({ task: String(d.task ?? ""), t: e.t }); }
+      const domain = d.domain != null ? String(d.domain) : null;
+      if (isSyntheticTraffic(domain)) {
+        qPlayground++;
+      } else {
+        qReal++;
+        if (realSamples.length < 12) realSamples.push({ task: String(d.task ?? ""), domain, t: e.t });
+        // Coverage gaps are only meaningful for REAL demand. Zero-result counting
+        // lives inside this branch so the smoke suite's deliberate garbage probe
+        // and e2e loop traffic never masquerade as "what to author next".
+        if (Number(d.results ?? 0) === 0) { qZero++; if (zeroSamples.length < 15) zeroSamples.push({ task: String(d.task ?? ""), t: e.t }); }
+      }
     } else if (e.type === "attest") {
       if (d.rejected) continue;
       if (d.outcome === "success") attestS++; else if (d.outcome === "failure") attestF++;
@@ -791,7 +810,7 @@ async function demandMetrics(env: Env): Promise<DemandMetrics> {
   return {
     window: "last ≤1000 events (30-day retention)",
     queries_total: totalQ, queries_real: qReal, queries_playground: qPlayground,
-    queries_zero_result: qZero, zero_result_rate: totalQ ? +(qZero / totalQ).toFixed(3) : 0,
+    queries_zero_result: qZero, zero_result_rate: qReal ? +(qZero / qReal).toFixed(3) : 0,
     attestations: attestTotal, attest_success: attestS, attest_failure: attestF,
     attest_rate_per_real_query: qReal ? +(attestTotal / qReal).toFixed(3) : 0,
     contributions_community: contribCommunity, contributions_operator: contribOperator,
@@ -852,9 +871,9 @@ footer{color:#5b6880;font-size:12.5px;margin-top:34px}</style></head><body>
 <p class="lede">Route count is a supply metric. These are the numbers that show a network forming: real agent queries, coverage gaps, attestations, and external contributions.</p>
 <p class="win">Window: ${esc2(m.window)}</p>
 <div class="grid">
-${card("Real agent queries", m.queries_real, "excludes homepage playground")}
-${card("Playground queries", m.queries_playground, "homepage demo traffic")}
-${card("Zero-result", `${m.queries_zero_result}`, `${(m.zero_result_rate * 100).toFixed(1)}% of all queries`)}
+${card("Real agent queries", m.queries_real, "excludes playground + test traffic")}
+${card("Playground / test", m.queries_playground, "homepage demo + smoke/e2e probes")}
+${card("Zero-result", `${m.queries_zero_result}`, `${(m.zero_result_rate * 100).toFixed(1)}% of real queries`)}
 </div>
 <div class="grid">
 <div class="c hl"><div class="cl">Attestation rate</div><div class="cv">${m.attest_rate_per_real_query}</div><div class="cs">per real query · ${m.attestations} total (${m.attest_success}✓/${m.attest_failure}✗)</div></div>
