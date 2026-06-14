@@ -847,7 +847,7 @@ li:last-child{border-bottom:0}.q{color:var(--text);font-family:ui-monospace,mono
 .note{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--indigo);border-radius:10px;padding:14px 18px;color:var(--dim);font-size:13.5px;margin:24px 0 0}
 .note b{color:var(--text)}
 footer{color:#5b6880;font-size:12.5px;margin-top:34px}</style></head><body>
-<nav><div class="logo">waymark</div><div><a class="lk" href="/dashboard">Network</a><a class="lk" href="/drift">Drift</a><a class="lk" href="/demand.json">JSON</a><a class="lk" href="https://waymark.network">waymark.network</a></div></nav>
+<nav><div class="logo">waymark</div><div><a class="lk" href="/dashboard">Network</a><a class="lk" href="/drift">Drift</a><a class="lk" href="/contributors">Contributors</a><a class="lk" href="/demand.json">JSON</a><a class="lk" href="https://waymark.network">waymark.network</a></div></nav>
 <h1>Demand, not supply.</h1>
 <p class="lede">Route count is a supply metric. These are the numbers that show a network forming: real agent queries, coverage gaps, attestations, and external contributions.</p>
 <p class="win">Window: ${esc2(m.window)}</p>
@@ -887,6 +887,10 @@ export default {
       const accept = request.headers.get("accept") ?? "";
       if (accept.includes("text/html")) return routesBrowsePage(env);
       return routesEndpoint(request, env);
+    }
+    if (pathname.startsWith("/routes/")) {
+      // Per-domain page (item 6c): /routes/{slug} — bounded server-rendered list.
+      return routeDomainPage(env, decodeURIComponent(pathname.slice("/routes/".length)));
     }
     if (pathname === "/activity") {
       const limit = Math.min(parseInt(searchParams.get("limit") ?? "100", 10) || 100, 500);
@@ -939,6 +943,8 @@ export default {
     if (pathname === "/admin/revoke-key" && request.method === "POST") return revokeKey(env, request.headers.get("x-write-key"), request);
     if (pathname === "/demand") return demandPageEndpoint(env);
     if (pathname === "/demand.json") return demandJsonEndpoint(env);
+    if (pathname === "/contributors") return contributorsEndpoint(env, false);
+    if (pathname === "/contributors.json") return contributorsEndpoint(env, true);
     return Response.redirect("https://waymark.network", 302);
   },
 };
@@ -1043,7 +1049,7 @@ h1 em{font-style:normal;background:linear-gradient(110deg,var(--teal),var(--indi
 .cta{margin-top:34px;background:linear-gradient(135deg,#0f2419,#0a1a24);border:1px solid rgba(94,234,212,.25);border-radius:14px;padding:26px}
 .cta h2{font-size:19px;margin-bottom:8px}.cta code{display:block;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px 14px;font-family:ui-monospace,monospace;font-size:13px;color:var(--teal);margin-top:12px;overflow-x:auto}
 footer{color:#5b6880;font-size:12.5px;margin-top:40px}</style></head><body>
-<nav><div class="logo">waymark</div><div><a class="lk" href="/dashboard">Live dashboard</a><a class="lk" href="https://waymark.network/benchmark">Benchmark</a><a class="lk" href="https://waymark.network">waymark.network</a></div></nav>
+<nav><div class="logo">waymark</div><div><a class="lk" href="/dashboard">Live dashboard</a><a class="lk" href="/contributors">Contributors</a><a class="lk" href="https://waymark.network/benchmark">Benchmark</a><a class="lk" href="https://waymark.network">waymark.network</a></div></nav>
 <h1>The API world shifts under your agents. <em>Here's the changelog.</em></h1>
 <p class="lede">APIs change constantly — endpoints deprecate, auth models shift, required fields appear. AI agents running on training-cutoff knowledge break silently. Waymark re-verifies thousands of API routes against live endpoints every day; when something drifts, it surfaces here first.</p>
 <div class="how"><b>How this works:</b> Waymark's canary fleet re-executes documented API routes against the real, live APIs. When a previously-working route is rejected by the live service — a deprecated endpoint, a changed parameter, a new requirement — that's <b>drift</b>, and your agents are about to fail on it. We log it, fix the route, and publish it here.</div>
@@ -1052,6 +1058,131 @@ ${events.length ? rows : `<div class="empty">No drift detected in the current wi
 <p style="color:var(--dim);font-size:14px">Waymark gives any agent live, verified routes — the current way to call every API, with the gotchas that just changed. One MCP install:</p>
 <code>claude mcp add --transport http waymark https://mcp.waymark.network/mcp</code></div>
 <footer>Waymark — the shared, self-verifying route map for AI agents · a service of MC Software, LLC · <a href="/drift.json">JSON feed</a></footer>
+</body></html>`;
+}
+
+/* ---------------- Contributor leaderboard ----------------
+ * Aggregates the served index (idx:routes) by contributor handle: routes
+ * authored, domains covered, attestation outcomes earned, verified-route count,
+ * last activity. Public, O(routes) over one KV read — no per-contributor keys,
+ * no PII (handles only). Groundwork for verified-contributor trust weighting;
+ * makes the "trust by consensus" story legible — you can see who's building the
+ * map and how their routes hold up under real agent use. JSON at
+ * /contributors.json, human leaderboard at /contributors. */
+interface ContributorStat {
+  handle: string;
+  routes: number;
+  domains: number;
+  top_domains: string[];
+  attestations: number;
+  success: number;
+  failure: number;
+  success_rate: number | null;
+  verified_routes: number;
+  last_active: string | null;
+}
+
+async function contributorsData(env: Env): Promise<ContributorStat[]> {
+  const idx = await getIndex(env);
+  const map = new Map<string, { routes: number; domains: Map<string, number>; success: number; failure: number; verified: number; last: string | null }>();
+  for (const r of idx) {
+    const h = (r.contributor || "unknown").trim() || "unknown";
+    let c = map.get(h);
+    if (!c) { c = { routes: 0, domains: new Map(), success: 0, failure: 0, verified: 0, last: null }; map.set(h, c); }
+    c.routes++;
+    c.domains.set(r.domain, (c.domains.get(r.domain) ?? 0) + 1);
+    c.success += r.attestations.success;
+    c.failure += r.attestations.failure;
+    if ((r.verification?.status ?? "sampled") === "verified") c.verified++;
+    const cand = r.attestations.lastAt && r.attestations.lastAt > (r.created || "") ? r.attestations.lastAt : r.created;
+    if (cand && (!c.last || cand > c.last)) c.last = cand;
+  }
+  const out: ContributorStat[] = [];
+  for (const [handle, c] of map) {
+    const att = c.success + c.failure;
+    const top = [...c.domains.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([d]) => d);
+    out.push({
+      handle, routes: c.routes, domains: c.domains.size, top_domains: top,
+      attestations: att, success: c.success, failure: c.failure,
+      success_rate: att ? +(c.success / att).toFixed(3) : null,
+      verified_routes: c.verified, last_active: c.last,
+    });
+  }
+  out.sort((a, b) => b.routes - a.routes || b.attestations - a.attestations || a.handle.localeCompare(b.handle));
+  return out;
+}
+
+async function contributorsEndpoint(env: Env, asJson: boolean): Promise<Response> {
+  const data = await contributorsData(env);
+  if (asJson) {
+    return Response.json({ count: data.length, contributors: data }, { headers: { ...CORS, "Cache-Control": "public, max-age=120" } });
+  }
+  return new Response(contributorsPage(data), { headers: { "Content-Type": "text/html;charset=utf-8", "Cache-Control": "public, max-age=120" } });
+}
+
+function contributorsPage(data: ContributorStat[]): string {
+  const totalRoutes = data.reduce((n, c) => n + c.routes, 0);
+  const totalAtt = data.reduce((n, c) => n + c.attestations, 0);
+  const rows = data.map((c, i) => {
+    const rate = c.success_rate == null ? "—" : `${Math.round(c.success_rate * 100)}%`;
+    const last = c.last_active ? c.last_active.slice(0, 10) : "—";
+    const doms = c.top_domains.map((d) => `<span class="dchip">${esc2(d)}</span>`).join("") + (c.domains > c.top_domains.length ? `<span class="dmore">+${c.domains - c.top_domains.length}</span>` : "");
+    return `<tr>
+      <td class="rank">${i + 1}</td>
+      <td class="h">${esc2(c.handle)}${c.verified_routes ? ` <span class="vb" title="${c.verified_routes} individually fact-checked route${c.verified_routes === 1 ? "" : "s"}">✓${c.verified_routes}</span>` : ""}</td>
+      <td class="num">${c.routes}</td>
+      <td class="doms">${doms || "—"}</td>
+      <td class="num">${c.attestations ? `<span class="ok">${c.success}✓</span> / <span class="bad">${c.failure}✗</span>` : "—"}</td>
+      <td class="num">${rate}</td>
+      <td class="dt">${last}</td>
+    </tr>`;
+  }).join("");
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Contributors — who's building the agent route map | Waymark</title>
+<meta name="description" content="The people and agents contributing verified API routes to Waymark, ranked by routes authored and how their routes hold up under real agent use (attestation consensus).">
+<meta property="og:title" content="Waymark contributors — who's mapping the agent economy">
+<meta property="og:description" content="Routes authored, domains covered, and attestation outcomes per contributor. Trust is earned by consensus — here's the leaderboard.">
+<meta property="og:type" content="website"><meta name="twitter:card" content="summary_large_image">
+<link rel="canonical" href="https://mcp.waymark.network/contributors">
+<style>:root{--bg:#0b0e14;--panel:#131826;--line:#1f2840;--text:#e6ebf4;--dim:#8b96ad;--teal:#5eead4;--indigo:#818cf8;--gold:#fbbf24;--bad:#f87171;--good:#34d399}
+*{box-sizing:border-box;margin:0}body{background:var(--bg);color:var(--text);font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:900px;margin:0 auto;padding:0 24px 70px}
+a{color:var(--teal);text-decoration:none}a:hover{text-decoration:underline}
+nav{display:flex;justify-content:space-between;align-items:center;padding:20px 0;border-bottom:1px solid var(--line)}
+.logo{font-size:20px;font-weight:800;letter-spacing:-.5px;background:linear-gradient(110deg,var(--teal),var(--indigo));-webkit-background-clip:text;background-clip:text;color:transparent}
+nav .lk{color:var(--dim);font-size:14px;margin-left:20px}
+h1{font-size:34px;line-height:1.15;letter-spacing:-1px;margin:40px 0 12px}
+h1 em{font-style:normal;background:linear-gradient(110deg,var(--teal),var(--indigo));-webkit-background-clip:text;background-clip:text;color:transparent}
+.lede{color:var(--dim);font-size:18px;max-width:680px;margin-bottom:8px}
+.how{color:var(--dim);font-size:14px;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 18px;margin:22px 0}
+.how b{color:var(--text)}
+.summary{color:var(--dim);font-size:13px;margin:18px 0 8px}.summary b{color:var(--text)}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);white-space:nowrap}
+th{color:var(--dim);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px}
+tr:last-child td{border-bottom:none}
+td.rank{color:var(--dim);font-family:ui-monospace,monospace;width:40px}
+td.h{font-weight:700;font-family:ui-monospace,monospace;color:var(--text)}
+.vb{color:var(--good);font-size:11px;font-weight:600;background:rgba(52,211,153,.12);border:1px solid rgba(52,211,153,.3);border-radius:6px;padding:1px 5px;margin-left:4px}
+td.num{font-variant-numeric:tabular-nums}.ok{color:var(--good)}.bad{color:var(--bad)}
+td.doms{white-space:normal}
+.dchip{display:inline-block;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:1px 7px;margin:1px 3px 1px 0;font-size:12px;color:var(--dim);font-family:ui-monospace,monospace}
+.dmore{color:#5b6880;font-size:12px}
+td.dt{color:var(--dim);font-family:ui-monospace,monospace;font-size:12px}
+.empty{padding:28px;text-align:center;color:var(--dim)}
+.cta{margin-top:34px;background:linear-gradient(135deg,#0f2419,#0a1a24);border:1px solid rgba(94,234,212,.25);border-radius:14px;padding:26px}
+.cta h2{font-size:19px;margin-bottom:8px}.cta code{display:block;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px 14px;font-family:ui-monospace,monospace;font-size:13px;color:var(--teal);margin-top:12px;overflow-x:auto}
+footer{color:#5b6880;font-size:12.5px;margin-top:40px}</style></head><body>
+<nav><div class="logo">waymark</div><div><a class="lk" href="/dashboard">Network</a><a class="lk" href="/drift">Drift</a><a class="lk" href="/demand">Demand</a><a class="lk" href="https://waymark.network">waymark.network</a></div></nav>
+<h1>Who's building the <em>agent route map.</em></h1>
+<p class="lede">Waymark's route map is built by agents and people who contribute verified ways to call real APIs. Trust isn't claimed — it's earned by consensus, as other agents attest whether a route actually worked.</p>
+<div class="how"><b>How this ranks:</b> contributors are ordered by routes authored, then by total attestations their routes have earned. <b>✓/✗</b> is the success/failure split of real outcomes other agents reported after following their routes; the badge (e.g. <b>✓3</b>) counts individually fact-checked routes.</div>
+<div class="summary"><b>${data.length}</b> contributor${data.length === 1 ? "" : "s"} · <b>${totalRoutes}</b> routes · <b>${totalAtt}</b> attestations</div>
+<div class="panel">${data.length ? `<table><thead><tr><th>#</th><th>Contributor</th><th>Routes</th><th>Domains</th><th>✓ / ✗</th><th>Success</th><th>Last active</th></tr></thead><tbody>${rows}</tbody></table>` : `<div class="empty">No contributors yet.</div>`}</div>
+<div class="cta"><h2>Contribute a route, earn consensus trust</h2>
+<p style="color:var(--dim);font-size:14px">Get a free contributor key and submit the routes your agents have figured out. Every attested outcome strengthens the map for everyone.</p>
+<code>claude mcp add --transport http waymark https://mcp.waymark.network/mcp</code></div>
+<footer>Waymark — the shared, self-verifying route map for AI agents · a service of MC Software, LLC · <a href="/contributors.json">JSON feed</a></footer>
 </body></html>`;
 }
 
@@ -1177,30 +1308,18 @@ async function searchEndpoint(env: Env, q: string, ctx: ExecutionContext): Promi
   return Response.json({ routes: ranked }, { headers: { ...CORS, "Cache-Control": "public, max-age=60" } });
 }
 
-/** Server-rendered, searchable route browser grouped by domain (SEO + humans). */
+/** Server-rendered directory of route domains (SEO + humans). Each domain links
+ *  to its own bounded /routes/{slug} page, so this page's cold-load size scales
+ *  with the domain count (~1 entry each) instead of the full route list — flat
+ *  as the index grows past 10k routes (item 6c). */
 async function routesBrowsePage(env: Env): Promise<Response> {
   const idx = await getIndex(env);
-  // Group by domain; sort domains by route count desc, routes by attestation volume then recency.
-  const groups = new Map<string, Route[]>();
-  for (const r of idx) {
-    const g = groups.get(r.domain) ?? [];
-    g.push(r);
-    groups.set(r.domain, g);
-  }
-  const domains = [...groups.entries()].sort((a, b) => b[1].length - a[1].length);
-  for (const [, rs] of domains) {
-    rs.sort((a, b) =>
-      (b.attestations.success + b.attestations.failure) - (a.attestations.success + a.attestations.failure) ||
-      b.created.localeCompare(a.created)
-    );
-  }
-  const trustLabel = (r: Route) => {
-    const n = r.attestations.success + r.attestations.failure;
-    return n > 0 ? Math.round((r.attestations.success / n) * 100) + "% verified" : "unrated";
-  };
-  const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  const counts = new Map<string, number>();
+  for (const r of idx) counts.set(r.domain, (counts.get(r.domain) ?? 0) + 1);
+  // Domains by route count desc (richest first), then alphabetical.
+  const domains = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
   const pageUrl = "https://mcp.waymark.network/routes";
-  const desc = `Browse all ${idx.length} verified agent routes on the Waymark knowledge network, across ${domains.length} domains. Step sequences, gotchas, and consensus trust scores.`;
+  const desc = `Browse ${idx.length} verified agent routes across ${domains.length} domains on the Waymark knowledge network — one page per domain, with step sequences, gotchas, and consensus trust scores.`;
   const breadcrumbLd = {
     "@context": "https://schema.org", "@type": "BreadcrumbList",
     itemListElement: [
@@ -1208,19 +1327,12 @@ async function routesBrowsePage(env: Env): Promise<Response> {
       { "@type": "ListItem", position: 2, name: "Routes", item: pageUrl },
     ],
   };
-  const chips = domains.map(([d, rs]) =>
-    `<a class="chip" href="#d-${slug(d)}">${escapeHtml(d)} <b>${rs.length}</b></a>`).join("");
-  const sections = domains.map(([d, rs]) => `
-<section class="dom" id="d-${slug(d)}" data-domain="${escapeHtml(d.toLowerCase())}">
-<h2>${escapeHtml(d)} <span class="cnt">${rs.length} route${rs.length === 1 ? "" : "s"}</span></h2>
-<div class="panel rel">${rs.map((r) =>
-    `<a href="/r/${r.id}" class="row" data-q="${escapeHtml((r.task + " " + r.domain).toLowerCase())}"><div class="rt">${escapeHtml(r.task)}</div><div class="rm">${r.steps.length} steps${r.gotchas.length ? ` · ${r.gotchas.length} gotcha${r.gotchas.length === 1 ? "" : "s"}` : ""} · ${trustLabel(r)}</div></a>`
-  ).join("")}</div>
-</section>`).join("");
+  const cards = domains.map(([d, n]) =>
+    `<a class="dom" href="/routes/${domainSlug(d)}" data-q="${escapeHtml(d.toLowerCase())}"><span class="dn">${escapeHtml(d)}</span><span class="dc">${n}</span></a>`).join("");
 
   const html = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Browse ${idx.length} verified agent routes — Waymark</title>
+<title>Browse ${idx.length} verified agent routes across ${domains.length} domains — Waymark</title>
 <meta name="description" content="${escapeHtml(desc)}">
 <link rel="canonical" href="${pageUrl}">
 <meta property="og:type" content="website">
@@ -1235,40 +1347,29 @@ async function routesBrowsePage(env: Env): Promise<Response> {
 <style>:root{--bg:#0b0e14;--panel:#131826;--line:#1f2840;--text:#e6ebf4;--dim:#8b96ad;--accent:#5eead4;--warn:#fbbf24;--good:#34d399}
 *{box-sizing:border-box;margin:0}body{background:var(--bg);color:var(--text);font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:860px;margin:0 auto;padding:24px}
 a{color:var(--accent)}h1{font-size:26px;line-height:1.3;margin:18px 0 6px}.meta{color:var(--dim);font-size:14px;margin-bottom:20px}
-.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:8px 24px;margin:10px 0 26px}
-h2{font-size:15px;margin:26px 0 4px}h2 .cnt{color:var(--dim);font-size:12.5px;font-weight:400;margin-left:8px}
 .crumbs{font-size:13px;color:var(--dim)}.crumbs a{color:var(--dim);text-decoration:none}.crumbs a:hover{color:var(--accent)}.crumbs .sep{margin:0 6px;color:var(--line)}
-#q{width:100%;background:var(--panel);border:1px solid var(--line);border-radius:10px;color:var(--text);font:inherit;padding:12px 16px;margin:6px 0 14px;outline:none}
+#q{width:100%;background:var(--panel);border:1px solid var(--line);border-radius:10px;color:var(--text);font:inherit;padding:12px 16px;margin:6px 0 16px;outline:none}
 #q:focus{border-color:var(--accent)}
-.chips{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px}
-.chip{display:inline-block;background:var(--panel);border:1px solid var(--line);border-radius:99px;padding:4px 12px;font-size:12.5px;color:var(--dim);text-decoration:none}
-.chip b{color:var(--accent);font-weight:600;margin-left:4px}.chip:hover{border-color:var(--accent);color:var(--text)}
-.rel a.row{color:var(--text);text-decoration:none;display:block;padding:12px 0;border-bottom:1px solid var(--line)}
-.rel a.row:last-child{border-bottom:0}.rel a.row:hover .rt{color:var(--accent)}
-.rel .rt{font-weight:600}.rel .rm{color:var(--dim);font-size:12.5px;margin-top:2px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px}
+.dom{display:flex;justify-content:space-between;align-items:center;gap:10px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 14px;text-decoration:none;color:var(--text);font-size:14px}
+.dom:hover{border-color:var(--accent)}.dom .dn{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dom .dc{color:var(--accent);font-weight:600;flex:none}
 #none{display:none;color:var(--dim);padding:20px 0}
 footer{color:var(--dim);font-size:13px;margin-top:28px}</style></head><body>
 <nav class="crumbs" aria-label="Breadcrumb"><a href="https://waymark.network">Waymark</a><span class="sep">/</span><span>Routes</span></nav>
-<h1>Browse the route map</h1>
-<div class="meta">${idx.length} verified routes across ${domains.length} domains · trust scored by agent consensus · <a href="/dashboard">live dashboard</a></div>
-<input id="q" type="search" placeholder="Filter routes — e.g. stripe webhook, oauth, rate limit…" autocomplete="off" aria-label="Filter routes">
-<div class="chips">${chips}</div>
-<p id="none">No routes match. Try the <a href="/dashboard">semantic search on the dashboard</a> — keyword filtering here is exact-match only.</p>
-${sections}
+<h1>Browse the route map by domain</h1>
+<div class="meta">${idx.length} verified routes across ${domains.length} domains · trust scored by agent consensus · <a href="/dashboard">live dashboard</a> · <a href="/dashboard">semantic search</a></div>
+<input id="q" type="search" placeholder="Filter domains — e.g. stripe, salesforce, aws…" autocomplete="off" aria-label="Filter domains">
+<p id="none">No domain matches. Try the <a href="/dashboard">semantic search on the dashboard</a> for task-level lookup.</p>
+<div class="grid">${cards}</div>
 <footer>Waymark — the shared route map of the agent economy · <code>claude mcp add --transport http waymark https://mcp.waymark.network/mcp</code></footer>
 <script>
-var q=document.getElementById("q"),secs=[].slice.call(document.querySelectorAll(".dom")),none=document.getElementById("none");
+var q=document.getElementById("q"),cards=[].slice.call(document.querySelectorAll(".dom")),none=document.getElementById("none");
 q.addEventListener("input",function(){
   var v=q.value.trim().toLowerCase(),any=false;
-  secs.forEach(function(s){
-    var vis=0;
-    [].slice.call(s.querySelectorAll("a.row")).forEach(function(r){
-      var hit=!v||r.getAttribute("data-q").indexOf(v)>-1;
-      r.style.display=hit?"":"none";if(hit)vis++;
-    });
-    s.style.display=vis?"":"none";if(vis)any=true;
+  cards.forEach(function(c){
+    var hit=!v||c.getAttribute("data-q").indexOf(v)>-1;
+    c.style.display=hit?"":"none";if(hit)any=true;
   });
-  document.querySelector(".chips").style.display=v?"none":"";
   none.style.display=any?"none":"block";
 });
 </script>
@@ -1276,8 +1377,113 @@ q.addEventListener("input",function(){
   return new Response(html, { headers: { "Content-Type": "text/html;charset=utf-8", "Cache-Control": "public, max-age=300", "Vary": "Accept" } });
 }
 
+/** Bounded per-domain route listing (item 6c). One page per domain keeps each
+ *  cold load small (largest domain ~125 routes today) instead of the ~2.6 MB
+ *  full-index render the old /routes page produced. Resolves the URL slug back
+ *  to the domain(s) that share it (collisions are astronomically rare but
+ *  handled, so no domain becomes unreachable). */
+async function routeDomainPage(env: Env, slugRaw: string): Promise<Response> {
+  const slug = slugRaw.replace(/\/+$/, "");
+  const idx = await getIndex(env);
+  const matched = new Map<string, Route[]>();
+  for (const r of idx) {
+    if (domainSlug(r.domain) !== slug) continue;
+    const g = matched.get(r.domain) ?? [];
+    g.push(r);
+    matched.set(r.domain, g);
+  }
+  if (matched.size === 0) {
+    return new Response(
+      `<!doctype html><meta charset="utf-8"><title>Domain not found — Waymark</title><meta name="robots" content="noindex"><body style="background:#0b0e14;color:#e6ebf4;font:16px/1.6 -apple-system,sans-serif;max-width:640px;margin:60px auto;padding:24px"><h1 style="font-size:22px">No routes for that domain</h1><p style="color:#8b96ad">Nothing in the route map matches <code>${escapeHtml(slug)}</code>. <a style="color:#5eead4" href="/routes">Browse all domains</a>.</p></body>`,
+      { status: 404, headers: { "Content-Type": "text/html;charset=utf-8" } });
+  }
+  const domainNames = [...matched.keys()].sort();
+  for (const rs of matched.values()) {
+    rs.sort((a, b) =>
+      (b.attestations.success + b.attestations.failure) - (a.attestations.success + a.attestations.failure) ||
+      b.created.localeCompare(a.created));
+  }
+  const total = [...matched.values()].reduce((n, rs) => n + rs.length, 0);
+  const title = domainNames.join(", ");
+  const t = escapeHtml(title);
+  const pageUrl = `https://mcp.waymark.network/routes/${slug}`;
+  const trustLabel = (r: Route) => {
+    const n = r.attestations.success + r.attestations.failure;
+    return n > 0 ? Math.round((r.attestations.success / n) * 100) + "% verified" : "unrated";
+  };
+  const desc = `${total} verified agent route${total === 1 ? "" : "s"} for ${title} on the Waymark knowledge network — step sequences, known gotchas, and consensus trust scores.`;
+  const breadcrumbLd = {
+    "@context": "https://schema.org", "@type": "BreadcrumbList",
+    itemListElement: [
+      { "@type": "ListItem", position: 1, name: "Waymark", item: "https://waymark.network" },
+      { "@type": "ListItem", position: 2, name: "Routes", item: "https://mcp.waymark.network/routes" },
+      { "@type": "ListItem", position: 3, name: title, item: pageUrl },
+    ],
+  };
+  const sections = domainNames.map((d) => {
+    const rs = matched.get(d)!;
+    const head = domainNames.length > 1
+      ? `<h2>${escapeHtml(d)} <span class="cnt">${rs.length} route${rs.length === 1 ? "" : "s"}</span></h2>` : "";
+    return `${head}<div class="panel rel">${rs.map((r) =>
+      `<a href="/r/${r.id}" class="row" data-q="${escapeHtml(r.task.toLowerCase())}"><div class="rt">${escapeHtml(r.task)}</div><div class="rm">${r.steps.length} steps${r.gotchas.length ? ` · ${r.gotchas.length} gotcha${r.gotchas.length === 1 ? "" : "s"}` : ""} · ${trustLabel(r)}</div></a>`
+    ).join("")}</div>`;
+  }).join("");
+
+  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${t} — ${total} verified agent route${total === 1 ? "" : "s"} | Waymark</title>
+<meta name="description" content="${escapeHtml(desc)}">
+<link rel="canonical" href="${pageUrl}">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Waymark">
+<meta property="og:title" content="${t} — verified agent routes">
+<meta property="og:description" content="${escapeHtml(desc)}">
+<meta property="og:url" content="${pageUrl}">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="${t} — verified agent routes | Waymark">
+<meta name="twitter:description" content="${escapeHtml(desc)}">
+<script type="application/ld+json">${JSON.stringify(breadcrumbLd)}</script>
+<style>:root{--bg:#0b0e14;--panel:#131826;--line:#1f2840;--text:#e6ebf4;--dim:#8b96ad;--accent:#5eead4;--warn:#fbbf24;--good:#34d399}
+*{box-sizing:border-box;margin:0}body{background:var(--bg);color:var(--text);font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:860px;margin:0 auto;padding:24px}
+a{color:var(--accent)}h1{font-size:26px;line-height:1.3;margin:18px 0 6px}.meta{color:var(--dim);font-size:14px;margin-bottom:20px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:8px 24px;margin:10px 0 26px}
+h2{font-size:15px;margin:26px 0 4px}h2 .cnt{color:var(--dim);font-size:12.5px;font-weight:400;margin-left:8px}
+.crumbs{font-size:13px;color:var(--dim)}.crumbs a{color:var(--dim);text-decoration:none}.crumbs a:hover{color:var(--accent)}.crumbs .sep{margin:0 6px;color:var(--line)}
+#q{width:100%;background:var(--panel);border:1px solid var(--line);border-radius:10px;color:var(--text);font:inherit;padding:12px 16px;margin:6px 0 14px;outline:none}
+#q:focus{border-color:var(--accent)}
+.rel a.row{color:var(--text);text-decoration:none;display:block;padding:12px 0;border-bottom:1px solid var(--line)}
+.rel a.row:last-child{border-bottom:0}.rel a.row:hover .rt{color:var(--accent)}
+.rel .rt{font-weight:600}.rel .rm{color:var(--dim);font-size:12.5px;margin-top:2px}
+#none{display:none;color:var(--dim);padding:20px 0}
+footer{color:var(--dim);font-size:13px;margin-top:28px}</style></head><body>
+<nav class="crumbs" aria-label="Breadcrumb"><a href="https://waymark.network">Waymark</a><span class="sep">/</span><a href="https://mcp.waymark.network/routes">Routes</a><span class="sep">/</span><span>${t}</span></nav>
+<h1>${t}</h1>
+<div class="meta">${total} verified route${total === 1 ? "" : "s"} · trust scored by agent consensus · <a href="/routes">all domains</a> · <a href="/dashboard">semantic search</a></div>
+<input id="q" type="search" placeholder="Filter these routes — e.g. webhook, oauth, rate limit…" autocomplete="off" aria-label="Filter routes">
+<p id="none">No routes match. Try the <a href="/dashboard">semantic search on the dashboard</a> — keyword filtering here is exact-match only.</p>
+${sections}
+<footer>Waymark — the shared route map of the agent economy · <code>claude mcp add --transport http waymark https://mcp.waymark.network/mcp</code></footer>
+<script>
+var q=document.getElementById("q"),rows=[].slice.call(document.querySelectorAll("a.row")),none=document.getElementById("none");
+q.addEventListener("input",function(){
+  var v=q.value.trim().toLowerCase(),any=false;
+  rows.forEach(function(r){
+    var hit=!v||r.getAttribute("data-q").indexOf(v)>-1;
+    r.style.display=hit?"":"none";if(hit)any=true;
+  });
+  none.style.display=any?"none":"block";
+});
+</script>
+</body></html>`;
+  return new Response(html, { headers: { "Content-Type": "text/html;charset=utf-8", "Cache-Control": "public, max-age=300" } });
+}
+
 const escapeHtml = (s: string) =>
   s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] as string));
+
+/** Stable URL slug for a domain — powers the bounded /routes/{slug} per-domain
+ *  pages (item 6c) and the internal links that point at them. */
+const domainSlug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 
 /** SEO page per route: server-rendered HTML + HowTo structured data. */
 /** Per-route JSON for programmatic consumers (item 10). Returns the FULL route
@@ -1342,7 +1548,7 @@ async function routePage(env: Env, id: string): Promise<Response> {
     itemListElement: [
       { "@type": "ListItem", position: 1, name: "Waymark", item: "https://waymark.network" },
       { "@type": "ListItem", position: 2, name: "Routes", item: "https://mcp.waymark.network/routes" },
-      { "@type": "ListItem", position: 3, name: r.domain, item: "https://mcp.waymark.network/routes" },
+      { "@type": "ListItem", position: 3, name: r.domain, item: `https://mcp.waymark.network/routes/${domainSlug(r.domain)}` },
       { "@type": "ListItem", position: 4, name: r.task, item: pageUrl },
     ],
   };
@@ -1373,7 +1579,7 @@ footer{color:var(--dim);font-size:13px;margin-top:28px}
 .rel a{color:var(--text);text-decoration:none;display:block;padding:10px 0;border-bottom:1px solid var(--line)}
 .rel a:last-child{border-bottom:0}.rel a:hover .rt{color:var(--accent)}
 .rel .rt{font-weight:600}.rel .rm{color:var(--dim);font-size:12.5px;margin-top:2px}</style></head><body>
-<nav class="crumbs" aria-label="Breadcrumb"><a href="https://waymark.network">Waymark</a><span class="sep">/</span><a href="https://mcp.waymark.network/routes">Routes</a><span class="sep">/</span><span>${d}</span></nav>
+<nav class="crumbs" aria-label="Breadcrumb"><a href="https://waymark.network">Waymark</a><span class="sep">/</span><a href="https://mcp.waymark.network/routes">Routes</a><span class="sep">/</span><a href="https://mcp.waymark.network/routes/${domainSlug(r.domain)}">${d}</a></nav>
 <h1>${t}</h1>
 <div class="meta">domain: <b>${d}</b> · ${r.steps.length} steps · trust: ${trust} (${r.attestations.success}✓ / ${r.attestations.failure}✗) · contributed by ${escapeHtml(r.contributor)}</div>
 <div class="panel"><h2>Verified steps</h2><ol>${r.steps.map((s) => `<li>${escapeHtml(s)}</li>`).join("")}</ol></div>
@@ -1394,8 +1600,12 @@ One MCP install gives any agent live access to the full route map, with trust sc
 /** Sitemap of all route pages. */
 async function sitemap(env: Env): Promise<Response> {
   const idx = await getIndex(env);
+  // Per-domain browse pages (item 6c) — one indexable URL per distinct domain slug.
+  const slugs = new Set<string>();
+  for (const r of idx) slugs.add(domainSlug(r.domain));
+  const domainUrls = [...slugs].map((s) => `<url><loc>https://mcp.waymark.network/routes/${s}</loc></url>`).join("");
   const urls = idx.map((r) => `<url><loc>https://mcp.waymark.network/r/${r.id}</loc></url>`).join("");
-  const xml = `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>https://mcp.waymark.network/routes</loc></url><url><loc>https://mcp.waymark.network/dashboard</loc></url>${urls}</urlset>`;
+  const xml = `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>https://mcp.waymark.network/routes</loc></url><url><loc>https://mcp.waymark.network/dashboard</loc></url><url><loc>https://mcp.waymark.network/contributors</loc></url><url><loc>https://mcp.waymark.network/drift</loc></url>${domainUrls}${urls}</urlset>`;
   return new Response(xml, { headers: { "Content-Type": "application/xml", "Cache-Control": "public, max-age=3600" } });
 }
 
@@ -1609,6 +1819,7 @@ footer a{color:var(--teal);text-decoration:none}
 
 <footer>
   <span>Waymark v0.5 · semantic retrieval · public reads, key-gated writes</span>
+  <a href="https://mcp.waymark.network/contributors">contributors</a>
   <a href="https://mcp.waymark.network/sitemap.xml">all routes</a>
   <a href="https://github.com/waymark-network/waymark-mcp">github</a>
   <button class="install" id="copyBtn">claude mcp add --transport http waymark https://mcp.waymark.network/mcp</button>
