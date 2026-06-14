@@ -927,6 +927,27 @@ export default {
   },
   dispatch(request: Request, env: Env, ctx: ExecutionContext): Response | Promise<Response> {
     const { pathname, searchParams } = new URL(request.url);
+    // CORS preflight: answer OPTIONS centrally with 204 so NO downstream handler
+    // runs. Previously OPTIONS had no special case, so a browser preflight to
+    // /search executed a real Vectorize retrieve() + logged a phantom
+    // "web-playground" query event (polluting demand telemetry) — and the reply
+    // carried no Allow-Methods/Allow-Headers, so genuinely preflighted requests
+    // (e.g. a browser MCP client POSTing /mcp with Mcp-Session-Id) were rejected.
+    // Echo the requested headers; advertise the methods the API actually uses.
+    if (request.method === "OPTIONS") {
+      const reqHeaders = request.headers.get("Access-Control-Request-Headers");
+      return new Response(null, {
+        status: 204,
+        headers: {
+          ...CORS,
+          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+          "Access-Control-Allow-Headers":
+            reqHeaders || "Content-Type, Authorization, Mcp-Session-Id, Mcp-Protocol-Version, X-Write-Key",
+          "Access-Control-Max-Age": "86400",
+          "Vary": "Origin, Access-Control-Request-Headers",
+        },
+      });
+    }
     if (pathname === "/mcp") {
       return WaymarkMCP.serve("/mcp").fetch(request, env, ctx);
     }
