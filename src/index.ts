@@ -999,9 +999,35 @@ export default {
     if (pathname === "/demand.json") return demandJsonEndpoint(env);
     if (pathname === "/contributors") return contributorsEndpoint(env, false);
     if (pathname === "/contributors.json") return contributorsEndpoint(env, true);
-    return Response.redirect("https://waymark.network", 302);
+    // Root → marketing site. EVERY other unknown path → an honest 404, NOT a
+    // soft-404 redirect-to-homepage. The old catch-all 302'd all unknown paths
+    // to waymark.network (200), so crawlers indexed every junk URL as a homepage
+    // duplicate and an API client got the marketing page (HTTP 200) on a typo'd
+    // endpoint instead of a clear failure. (Mirrors the item-5e fix on the Pages site.)
+    if (pathname === "/" || pathname === "") return Response.redirect("https://waymark.network", 302);
+    return notFound(request, pathname);
   },
 };
+
+/** Honest 404 for unknown worker paths. Content-negotiated: JSON for API-style
+ * requests (Accept: application/json or a .json path), branded noindex HTML
+ * otherwise. Never a redirect — a typo'd endpoint must fail, not silently 200. */
+function notFound(request: Request, pathname: string): Response {
+  const wantsJson =
+    pathname.endsWith(".json") ||
+    (request.headers.get("accept") || "").includes("application/json");
+  if (wantsJson) {
+    return new Response(JSON.stringify({ error: "not_found", path: pathname }, null, 2), {
+      status: 404,
+      headers: { ...CORS, "Content-Type": "application/json", "Cache-Control": "no-store" },
+    });
+  }
+  const p = escapeHtml(pathname);
+  return new Response(
+    `<!doctype html><meta charset="utf-8"><title>Not found — Waymark</title><meta name="robots" content="noindex"><body style="background:#0b0e14;color:#e6ebf4;font:16px/1.6 -apple-system,BlinkMacSystemFont,sans-serif;max-width:640px;margin:60px auto;padding:24px"><h1 style="font-size:22px">404 — not found</h1><p style="color:#8b96ad">No Waymark endpoint at <code>${p}</code>.</p><p style="color:#8b96ad">Try the <a style="color:#5eead4" href="/dashboard">live dashboard</a>, the <a style="color:#5eead4" href="/routes">route directory</a>, or <a style="color:#5eead4" href="https://waymark.network">waymark.network</a>.</p></body>`,
+    { status: 404, headers: { "Content-Type": "text/html;charset=utf-8", "Cache-Control": "no-store" } },
+  );
+}
 
 /** Public stats for the landing-page counters (CORS-open, cacheable 60s, ETag revalidation). */
 async function stats(request: Request, env: Env): Promise<Response> {
