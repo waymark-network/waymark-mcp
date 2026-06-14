@@ -889,8 +889,43 @@ ${card("Contributor keys", m.contributor_keys_issued, "issued all-time")}
 </body></html>`;
 }
 
+// Content-Security-Policy for all server-rendered HTML pages (dashboard, route
+// pages, /routes, /demand, /contributors, /drift). Conservative but real:
+// - script/style 'unsafe-inline' is required (inline <script> blocks + onclick
+//   handlers + inline styles in these templates); no external script origins.
+// - connect-src 'self': the dashboard only fetches same-origin (/stats,/activity,/routes).
+// - Google Fonts is the sole external origin (stylesheet on googleapis, woff2 on gstatic).
+// - frame-ancestors 'none' + X-Frame-Options block clickjacking.
+const HTML_CSP =
+  "default-src 'self'; " +
+  "base-uri 'self'; " +
+  "object-src 'none'; " +
+  "frame-ancestors 'none'; " +
+  "form-action 'self'; " +
+  "img-src 'self' data:; " +
+  "script-src 'self' 'unsafe-inline'; " +
+  "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
+  "font-src 'self' https://fonts.gstatic.com data:; " +
+  "connect-src 'self'";
+
 export default {
-  fetch(request: Request, env: Env, ctx: ExecutionContext) {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext) {
+    let res = await this.dispatch(request, env, ctx);
+    // Add security headers to server-rendered HTML responses only. Non-HTML
+    // surfaces (MCP transport, JSON APIs, sitemap, plaintext) are left untouched
+    // so nothing about the API contract or streaming behaviour changes.
+    const ct = res.headers.get("content-type") || "";
+    if (ct.includes("text/html")) {
+      res = new Response(res.body, res); // clone so headers are mutable
+      res.headers.set("Content-Security-Policy", HTML_CSP);
+      res.headers.set("X-Content-Type-Options", "nosniff");
+      res.headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
+      res.headers.set("X-Frame-Options", "DENY");
+      res.headers.set("Permissions-Policy", "geolocation=(), microphone=(), camera=()");
+    }
+    return res;
+  },
+  dispatch(request: Request, env: Env, ctx: ExecutionContext): Response | Promise<Response> {
     const { pathname, searchParams } = new URL(request.url);
     if (pathname === "/mcp") {
       return WaymarkMCP.serve("/mcp").fetch(request, env, ctx);
