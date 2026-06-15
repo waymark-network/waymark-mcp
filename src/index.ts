@@ -5,17 +5,23 @@
 /**
  * Waymark MCP server — collective procedural-knowledge network for AI agents.
  *
- * Tools:
- *   waymark_query      — find verified routes (step sequences that worked) for a task
+ * Tools (4):
+ *   waymark_query      — find routes (step sequences that worked) for a task,
+ *                        ranked by semantic similarity + community trust
  *   waymark_contribute — submit a sanitized trace of what worked / failed (API key)
  *   waymark_attest     — report the outcome of following a route (trust consensus)
+ *   waymark_register   — mint a free contributor key (no auth, one call) to contribute
  *
- * v0.2: full activity log (every tool call recorded to KV, 30-day TTL) +
- * public observability endpoints: /stats, /routes, /activity, /dashboard.
+ * Provenance is a per-route axis (verified / sampled / unverified), surfaced
+ * honestly in every response — routes are never blanket-labeled "verified".
  *
- * Alpha storage: Cloudflare KV (key = route id, plus a scan-friendly index).
- * Scale path: D1 for relational attestation history, Vectorize for semantic
- * route matching (replace keywordScore below with an embedding query).
+ * Observability: full activity log (every tool call recorded to KV, 30-day TTL) +
+ * public endpoints: /stats, /routes, /activity, /dashboard, /demand, /contributors, /drift.
+ *
+ * Storage: Cloudflare KV (key = route id, plus a compact index scored in memory).
+ * Retrieval (shipped, v0.5): primary ranker is cosine similarity over
+ * bge-base-en-v1.5 embeddings (Vectorize) with a confidence cutoff
+ * (VEC_MIN_SCORE — a wrong route is worse than none), keyword-index fallback.
  */
 
 import { McpAgent } from "agents/mcp";
@@ -96,7 +102,9 @@ const tokenize = (s: string) =>
  * Removes the N-reads-per-query cost and the 1000-route list cap on the
  * query path. Confidence threshold: a wrong route is worse than no route
  * (benchmark-proven), so low-confidence matches are refused.
- * Still interim: true semantic matching = Vectorize migration. */
+ * Now the FALLBACK path: semantic matching shipped in v0.5 (Vectorize +
+ * bge embeddings — see below); this keyword index serves only when the
+ * vector store is empty/unavailable. */
 
 type IdxEntry = Route;
 const INDEX_KEY = "idx:routes";
