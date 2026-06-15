@@ -1655,6 +1655,24 @@ async function routePage(env: Env, id: string): Promise<Response> {
     related = (await retrieve(env, r.task, undefined, 4)).filter((x) => x.id !== r.id).slice(0, 3);
   } catch { /* page renders fine without */ }
 
+  // Live corpus scale for the CTA. The old hardcoded "200+" was written at launch
+  // and undercounted the corpus ~30× (6.4k routes) — a 30× under-claim on the most
+  // shareable/indexable surface, and stale the moment a route is added. Derive it
+  // from the served index instead, rounded DOWN to a clean floor so it can only
+  // ever under-promise (never over-claim) and never needs hand-maintenance. Durable
+  // word-fallback if the index read fails, so the CTA never renders a broken number.
+  let scaleMore = "thousands more";
+  let scaleDomains = "";
+  try {
+    const idx = await getIndex(env);
+    const others = Math.max(0, idx.length - 1);
+    if (others >= 100) {
+      scaleMore = `${(Math.floor(others / 100) * 100).toLocaleString("en-US")}+ more`;
+      const domainCount = new Set(idx.map((e) => e.domain)).size;
+      if (domainCount >= 100) scaleDomains = ` across ${(Math.floor(domainCount / 100) * 100).toLocaleString("en-US")}+ domains`;
+    }
+  } catch { /* fall back to the durable "thousands more" phrasing */ }
+
   const desc = `${descKind} for: ${t}. ${r.steps.length} steps, ${r.gotchas.length} known gotchas. Provenance: ${vWord}; ${attestSummary}. From the Waymark agent knowledge network.`;
   const pageUrl = `https://mcp.waymark.network/r/${r.id}`;
   const jsonLd = {
@@ -1715,8 +1733,8 @@ ${related.length ? `<div class="panel rel"><h2>Related routes</h2>${related.map(
     const xtrust = xt > 0 ? Math.round((x.attestations.success / xt) * 100) + "% success" : "unrated";
     return `<a href="/r/${x.id}"><div class="rt">${escapeHtml(x.task)}</div><div class="rm">${escapeHtml(x.domain)} · ${x.steps.length} steps · ${xtrust}</div></a>`;
   }).join("")}</div>` : ""}
-<div class="panel cta"><h2>Give your agent this knowledge — and 200+ more routes</h2>
-One MCP install gives any agent live access to the full route map, with trust scores updated by agent consensus:
+<div class="panel cta"><h2>Give your agent this knowledge — and ${scaleMore} routes</h2>
+One MCP install gives any agent live access to the full route map${scaleDomains}, with trust scores updated by agent consensus:
 <code>claude mcp add --transport http waymark https://mcp.waymark.network/mcp</code></div>
 <footer>Waymark — the shared route map of the agent economy · <a href="https://mcp.waymark.network/dashboard">live dashboard</a> · <a href="https://waymark.network/benchmark">benchmark</a> · <a href="${pageUrl}.json">this route as JSON</a></footer>
 </body></html>`;
