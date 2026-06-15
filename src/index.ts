@@ -1726,12 +1726,32 @@ One MCP install gives any agent live access to the full route map, with trust sc
 /** Sitemap of all route pages. */
 async function sitemap(env: Env): Promise<Response> {
   const idx = await getIndex(env);
-  // Per-domain browse pages (item 6c) — one indexable URL per distinct domain slug.
-  const slugs = new Set<string>();
-  for (const r of idx) slugs.add(domainSlug(r.domain));
-  const domainUrls = [...slugs].map((s) => `<url><loc>https://mcp.waymark.network/routes/${s}</loc></url>`).join("");
-  const urls = idx.map((r) => `<url><loc>https://mcp.waymark.network/r/${r.id}</loc></url>`).join("");
-  const xml = `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>https://mcp.waymark.network/routes</loc></url><url><loc>https://mcp.waymark.network/dashboard</loc></url><url><loc>https://mcp.waymark.network/contributors</loc></url><url><loc>https://mcp.waymark.network/drift</loc></url>${domainUrls}${urls}</urlset>`;
+  // <lastmod> (W3C datetime) gives crawlers a per-URL recrawl signal across the
+  // 8600+ URLs here, so they can prioritise routes that actually changed instead
+  // of treating every page as equally stale. A route changes when it's (re)created
+  // or earns an attestation ⇒ lastmod = max(created, attestations.lastAt). The
+  // per-domain browse pages and the index pages take the max lastmod of the routes
+  // they aggregate (ISO-8601 Zulu strings sort lexicographically, so > is correct).
+  const routeMod = (r: Route): string => {
+    const a = r.attestations?.lastAt;
+    return a && a > r.created ? a : r.created;
+  };
+  const domainMod = new Map<string, string>(); // slug → newest lastmod in that domain
+  let corpusMod = "";
+  for (const r of idx) {
+    const m = routeMod(r);
+    if (m > corpusMod) corpusMod = m;
+    const s = domainSlug(r.domain);
+    const cur = domainMod.get(s);
+    if (!cur || m > cur) domainMod.set(s, m);
+  }
+  const lm = (m: string) => (m ? `<lastmod>${m}</lastmod>` : "");
+  const domainUrls = [...domainMod].map(([s, m]) => `<url><loc>https://mcp.waymark.network/routes/${s}</loc>${lm(m)}</url>`).join("");
+  const urls = idx.map((r) => `<url><loc>https://mcp.waymark.network/r/${r.id}</loc>${lm(routeMod(r))}</url>`).join("");
+  const top = ["/routes", "/dashboard", "/contributors", "/drift"]
+    .map((p) => `<url><loc>https://mcp.waymark.network${p}</loc>${lm(corpusMod)}</url>`)
+    .join("");
+  const xml = `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${top}${domainUrls}${urls}</urlset>`;
   return new Response(xml, { headers: { "Content-Type": "application/xml", "Cache-Control": "public, max-age=3600" } });
 }
 
