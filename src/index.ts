@@ -1420,7 +1420,7 @@ async function routesBrowsePage(env: Env): Promise<Response> {
   // Domains by route count desc (richest first), then alphabetical.
   const domains = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
   const pageUrl = "https://mcp.waymark.network/routes";
-  const desc = `Browse ${idx.length} verified agent routes across ${domains.length} domains on the Waymark knowledge network — one page per domain, with step sequences, gotchas, and consensus trust scores.`;
+  const desc = `Browse ${idx.length} agent routes across ${domains.length} domains on the Waymark knowledge network — one page per domain, with step sequences, gotchas, and consensus trust scores.`;
   const breadcrumbLd = {
     "@context": "https://schema.org", "@type": "BreadcrumbList",
     itemListElement: [
@@ -1433,16 +1433,16 @@ async function routesBrowsePage(env: Env): Promise<Response> {
 
   const html = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Browse ${idx.length} verified agent routes across ${domains.length} domains — Waymark</title>
+<title>Browse ${idx.length} agent routes across ${domains.length} domains — Waymark</title>
 <meta name="description" content="${escapeHtml(desc)}">
 <link rel="canonical" href="${pageUrl}">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="Waymark">
-<meta property="og:title" content="Browse ${idx.length} verified agent routes — Waymark">
+<meta property="og:title" content="Browse ${idx.length} agent routes — Waymark">
 <meta property="og:description" content="${escapeHtml(desc)}">
 <meta property="og:url" content="${pageUrl}">
 <meta name="twitter:card" content="summary">
-<meta name="twitter:title" content="Browse ${idx.length} verified agent routes — Waymark">
+<meta name="twitter:title" content="Browse ${idx.length} agent routes — Waymark">
 <meta name="twitter:description" content="${escapeHtml(desc)}">
 <script type="application/ld+json">${JSON.stringify(breadcrumbLd)}</script>
 <style>:root{--bg:#0b0e14;--panel:#131826;--line:#1f2840;--text:#e6ebf4;--dim:#8b96ad;--accent:#5eead4;--warn:#fbbf24;--good:#34d399}
@@ -1458,7 +1458,7 @@ a{color:var(--accent)}h1{font-size:26px;line-height:1.3;margin:18px 0 6px}.meta{
 footer{color:var(--dim);font-size:13px;margin-top:28px}</style></head><body>
 <nav class="crumbs" aria-label="Breadcrumb"><a href="https://waymark.network">Waymark</a><span class="sep">/</span><span>Routes</span></nav>
 <h1>Browse the route map by domain</h1>
-<div class="meta">${idx.length} verified routes across ${domains.length} domains · trust scored by agent consensus · <a href="/dashboard">live dashboard</a> · <a href="/dashboard">semantic search</a></div>
+<div class="meta">${idx.length} routes across ${domains.length} domains · trust scored by agent consensus · <a href="/dashboard">live dashboard</a> · <a href="/dashboard">semantic search</a></div>
 <input id="q" type="search" placeholder="Filter domains — e.g. stripe, salesforce, aws…" autocomplete="off" aria-label="Filter domains">
 <p id="none">No domain matches. Try the <a href="/dashboard">semantic search on the dashboard</a> for task-level lookup.</p>
 <div class="grid">${cards}</div>
@@ -1510,9 +1510,9 @@ async function routeDomainPage(env: Env, slugRaw: string): Promise<Response> {
   const pageUrl = `https://mcp.waymark.network/routes/${slug}`;
   const trustLabel = (r: Route) => {
     const n = r.attestations.success + r.attestations.failure;
-    return n > 0 ? Math.round((r.attestations.success / n) * 100) + "% verified" : "unrated";
+    return n > 0 ? Math.round((r.attestations.success / n) * 100) + "% success" : "unrated";
   };
-  const desc = `${total} verified agent route${total === 1 ? "" : "s"} for ${title} on the Waymark knowledge network — step sequences, known gotchas, and consensus trust scores.`;
+  const desc = `${total} agent route${total === 1 ? "" : "s"} for ${title} on the Waymark knowledge network — step sequences, known gotchas, and consensus trust scores.`;
   const breadcrumbLd = {
     "@context": "https://schema.org", "@type": "BreadcrumbList",
     itemListElement: [
@@ -1532,16 +1532,16 @@ async function routeDomainPage(env: Env, slugRaw: string): Promise<Response> {
 
   const html = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${t} — ${total} verified agent route${total === 1 ? "" : "s"} | Waymark</title>
+<title>${t} — ${total} agent route${total === 1 ? "" : "s"} | Waymark</title>
 <meta name="description" content="${escapeHtml(desc)}">
 <link rel="canonical" href="${pageUrl}">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="Waymark">
-<meta property="og:title" content="${t} — verified agent routes">
+<meta property="og:title" content="${t} — agent routes">
 <meta property="og:description" content="${escapeHtml(desc)}">
 <meta property="og:url" content="${pageUrl}">
 <meta name="twitter:card" content="summary">
-<meta name="twitter:title" content="${t} — verified agent routes | Waymark">
+<meta name="twitter:title" content="${t} — agent routes | Waymark">
 <meta name="twitter:description" content="${escapeHtml(desc)}">
 <script type="application/ld+json">${JSON.stringify(breadcrumbLd)}</script>
 <style>:root{--bg:#0b0e14;--panel:#131826;--line:#1f2840;--text:#e6ebf4;--dim:#8b96ad;--accent:#5eead4;--warn:#fbbf24;--good:#34d399}
@@ -1559,7 +1559,7 @@ h2{font-size:15px;margin:26px 0 4px}h2 .cnt{color:var(--dim);font-size:12.5px;fo
 footer{color:var(--dim);font-size:13px;margin-top:28px}</style></head><body>
 <nav class="crumbs" aria-label="Breadcrumb"><a href="https://waymark.network">Waymark</a><span class="sep">/</span><a href="https://mcp.waymark.network/routes">Routes</a><span class="sep">/</span><span>${t}</span></nav>
 <h1>${t}</h1>
-<div class="meta">${total} verified route${total === 1 ? "" : "s"} · trust scored by agent consensus · <a href="/routes">all domains</a> · <a href="/dashboard">semantic search</a></div>
+<div class="meta">${total} route${total === 1 ? "" : "s"} · trust scored by agent consensus · <a href="/routes">all domains</a> · <a href="/dashboard">semantic search</a></div>
 <input id="q" type="search" placeholder="Filter these routes — e.g. webhook, oauth, rate limit…" autocomplete="off" aria-label="Filter routes">
 <p id="none">No routes match. Try the <a href="/dashboard">semantic search on the dashboard</a> — keyword filtering here is exact-match only.</p>
 ${sections}
