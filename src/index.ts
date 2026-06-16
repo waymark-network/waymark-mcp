@@ -1080,7 +1080,23 @@ export default {
     }
     if (pathname === "/sitemap.xml") return sitemap(env);
     if (pathname === "/robots.txt") {
-      return new Response("User-agent: *\nAllow: /\nSitemap: https://mcp.waymark.network/sitemap.xml\n", {
+      // Every indexable HTML surface (/r/{id}, /routes, /routes/{slug}, /dashboard,
+      // /drift, /contributors) AND the JSON/data endpoints (advertised in /llms.txt
+      // for AI crawlers) stay crawlable by default. We only steer well-behaved bots
+      // off three non-page endpoints:
+      //  /search  — runs a BILLED Vectorize query and logs a demand event on EVERY
+      //             GET; a crawler walking it would cost money and pollute telemetry.
+      //  /admin/  — write-key-gated, privileged; never human content, never indexable.
+      //  /mcp     — POST-only MCP transport (GET → 405); not a page.
+      // No Allow:/ line: absence of a Disallow = allowed, so this is unambiguous under
+      // both longest-match (Googlebot) and first-match parsers.
+      const body =
+        "User-agent: *\n" +
+        "Disallow: /search\n" +
+        "Disallow: /admin/\n" +
+        "Disallow: /mcp\n" +
+        "Sitemap: https://mcp.waymark.network/sitemap.xml\n";
+      return new Response(body, {
         headers: { "Content-Type": "text/plain", "Cache-Control": "public, max-age=86400" },
       });
     }
