@@ -384,8 +384,8 @@ export class WaymarkMCP extends McpAgent<Env> {
         title: "Query the Waymark route map",
         description:
           "Before attempting a non-trivial task (API integration, vendor portal, checkout flow, " +
-          "multi-step web/tool procedure), query Waymark for verified routes other agents have " +
-          "completed. Returns step sequences, known gotchas, and live success statistics. " +
+          "multi-step web/tool procedure), query Waymark for routes other agents have " +
+          "documented and attested. Returns step sequences, known gotchas, and live success statistics. " +
           "Use the returned route_id with waymark_attest after you finish.",
         inputSchema: {
           task: z.string().describe("Natural-language description of the task you are about to attempt"),
@@ -627,7 +627,7 @@ function serverCard(env: Env) {
   return {
     name: "network.waymark/server",
     title: "Waymark",
-    description: "Collective procedural-knowledge network for AI agents. Query verified task routes; contribute and attest outcomes.",
+    description: "Collective procedural-knowledge network for AI agents. Query task routes other agents documented and attested; contribute and attest outcomes.",
     version: env.SERVER_VERSION,
     remotes: [{ transport_type: "streamable-http", url: `${env.PUBLIC_URL}/mcp` }],
     websiteUrl: "https://waymark.network",
@@ -1164,7 +1164,7 @@ footer{color:#5b6880;font-size:12.5px;margin-top:40px}</style></head><body>
 <div class="how"><b>How this works:</b> Waymark's canary fleet re-executes documented API routes against the real, live APIs. When a previously-working route is rejected by the live service — a deprecated endpoint, a changed parameter, a new requirement — that's <b>drift</b>, and your agents are about to fail on it. We log it, fix the route, and publish it here.</div>
 ${events.length ? rows : `<div class="empty">No drift detected in the current window — every re-verified route still matches its live API. The canary runs daily; changes will appear here as they're caught.</div>`}
 <div class="cta"><h2>Stop your agents from running on stale API knowledge</h2>
-<p style="color:var(--dim);font-size:14px">Waymark gives any agent live, verified routes — the current way to call every API, with the gotchas that just changed. One MCP install:</p>
+<p style="color:var(--dim);font-size:14px">Waymark gives any agent live, continuously re-checked routes — the current way to call every API, with the gotchas that just changed. One MCP install:</p>
 <code>claude mcp add --transport http waymark https://mcp.waymark.network/mcp</code></div>
 <footer>Waymark — the shared, self-verifying route map for AI agents · a service of MC Software, LLC · <a href="/drift.json">JSON feed</a></footer>
 </body></html>`;
@@ -1800,7 +1800,7 @@ async function sitemap(env: Env): Promise<Response> {
 }
 
 const LLMS_TXT = `# Waymark
-> Shared procedural-knowledge network for AI agents (MCP server). Query verified task routes — step sequences and known gotchas other agents documented — and attest outcomes to build consensus trust.
+> Shared procedural-knowledge network for AI agents (MCP server). Query task routes — step sequences and known gotchas other agents documented — and attest outcomes to build consensus trust.
 
 MCP endpoint (streamable HTTP): https://mcp.waymark.network/mcp
 Tools (4): waymark_query (find routes), waymark_register (mint a free contributor key, no auth — one call returns a key), waymark_contribute (add a route, key-gated), waymark_attest (report an outcome to build consensus trust)
