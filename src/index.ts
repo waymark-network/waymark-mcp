@@ -939,6 +939,30 @@ const HTML_CSP =
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
+    // Edge-cache the /r/{id} route pages (the largest crawlable surface: 6,440
+    // pages). Each cold render does a KV read PLUS a *billed* Vectorize
+    // retrieve() for the 3 related routes — re-paid on every hit today because
+    // Cloudflare does NOT auto-populate the edge cache for Worker-generated
+    // responses (Cache-Control only governs the downstream/browser cache). The
+    // Cache API (caches.default) is the one mechanism that *does* cache the
+    // rendered HTML at the POP — and unlike ETag/Last-Modified conditional GET
+    // (proven dead on this zone: CF strips HTML validators), it works on
+    // text/html. A route page is a pure function of its id — no auth, cookie,
+    // or Accept negotiation (/r/{id}.json is a separate path) — so the request
+    // URL is a complete, safe cache key (cache-busting query strings simply
+    // miss and render fresh). TTL honours the page's own max-age=300 contract,
+    // so this adds no staleness beyond what the page already promises.
+    const url = new URL(request.url);
+    const cacheable = request.method === "GET" &&
+      url.pathname.startsWith("/r/") && !url.pathname.endsWith(".json");
+    // `caches.default` is a Cloudflare global (the DOM CacheStorage lib that
+    // leaks into this build doesn't type it) — cast precisely, no `any`.
+    const cache = (caches as unknown as { default: Cache }).default;
+    if (cacheable) {
+      const hit = await cache.match(request);
+      if (hit) return hit; // already carries the security headers (cached post-injection)
+    }
+
     let res = await this.dispatch(request, env, ctx);
     // Add security headers to server-rendered HTML responses only. Non-HTML
     // surfaces (MCP transport, JSON APIs, sitemap, plaintext) are left untouched
@@ -951,6 +975,14 @@ export default {
       res.headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
       res.headers.set("X-Frame-Options", "DENY");
       res.headers.set("Permissions-Policy", "geolocation=(), microphone=(), camera=()");
+    }
+
+    // Populate the edge cache only for a successful HTML route page. The 404
+    // path (invalid/unknown id) is no-status-200 and intentionally not cached,
+    // so a route that appears later isn't masked by a cached miss. Cache the
+    // post-header-injection response so cache hits carry CSP/nosniff/etc.
+    if (cacheable && res.status === 200 && ct.includes("text/html")) {
+      ctx.waitUntil(cache.put(request, res.clone()));
     }
     return res;
   },
