@@ -939,22 +939,34 @@ const HTML_CSP =
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
-    // Edge-cache the /r/{id} route pages (the largest crawlable surface: 6,440
-    // pages). Each cold render does a KV read PLUS a *billed* Vectorize
-    // retrieve() for the 3 related routes — re-paid on every hit today because
-    // Cloudflare does NOT auto-populate the edge cache for Worker-generated
-    // responses (Cache-Control only governs the downstream/browser cache). The
+    // Edge-cache the server-rendered, crawlable HTML surfaces at the POP. Each
+    // cold render is expensive: /r/{id} (6,440 pages) does a KV read PLUS a
+    // *billed* Vectorize retrieve() for its 3 related routes; /routes/{slug}
+    // (2,170 per-domain directory pages) does a full ~1.3 MB idx:routes read +
+    // JSON.parse of every route on every hit. Cloudflare does NOT auto-populate
+    // the edge cache for Worker-generated responses (Cache-Control only governs
+    // the downstream/browser cache), so this cost is re-paid on every hit. The
     // Cache API (caches.default) is the one mechanism that *does* cache the
     // rendered HTML at the POP — and unlike ETag/Last-Modified conditional GET
     // (proven dead on this zone: CF strips HTML validators), it works on
-    // text/html. A route page is a pure function of its id — no auth, cookie,
-    // or Accept negotiation (/r/{id}.json is a separate path) — so the request
-    // URL is a complete, safe cache key (cache-busting query strings simply
-    // miss and render fresh). TTL honours the page's own max-age=300 contract,
-    // so this adds no staleness beyond what the page already promises.
+    // text/html. Each surface below is a pure function of its URL — no auth,
+    // cookie, or Accept negotiation: /r/{id}.json, /routes/{slug} (HTML-only,
+    // ignores Accept), /contributors.json and /drift.json are all *separate*
+    // paths, so the request URL is a complete, safe cache key (cache-busting
+    // query strings simply miss and render fresh). Each surface's own
+    // Cache-Control max-age governs the POP TTL (/r/{id} & /routes/{slug} 300s,
+    // /contributors 120s, /drift 600s), so this adds NO staleness beyond what
+    // each page already promises. Bare /routes is deliberately excluded — it
+    // content-negotiates (Vary: Accept), so a URL-only key could serve the HTML
+    // representation to a JSON consumer.
     const url = new URL(request.url);
-    const cacheable = request.method === "GET" &&
-      url.pathname.startsWith("/r/") && !url.pathname.endsWith(".json");
+    const p = url.pathname;
+    const cacheable = request.method === "GET" && (
+      (p.startsWith("/r/") && !p.endsWith(".json")) ||  // /r/{id} route pages
+      p.startsWith("/routes/") ||                        // /routes/{slug} per-domain dirs (HTML-only)
+      p === "/contributors" ||                           // leaderboard (/contributors.json is separate)
+      p === "/drift"                                     // drift tracker (/drift.json is separate)
+    );
     // `caches.default` is a Cloudflare global (the DOM CacheStorage lib that
     // leaks into this build doesn't type it) — cast precisely, no `any`.
     const cache = (caches as unknown as { default: Cache }).default;
@@ -977,10 +989,11 @@ export default {
       res.headers.set("Permissions-Policy", "geolocation=(), microphone=(), camera=()");
     }
 
-    // Populate the edge cache only for a successful HTML route page. The 404
-    // path (invalid/unknown id) is no-status-200 and intentionally not cached,
-    // so a route that appears later isn't masked by a cached miss. Cache the
-    // post-header-injection response so cache hits carry CSP/nosniff/etc.
+    // Populate the edge cache only for a successful (200) HTML response. The
+    // not-found paths (unknown /r/{id} id, empty/unmatched /routes/{slug}) are
+    // status-404 and intentionally not cached, so a route/domain that appears
+    // later isn't masked by a cached miss. Cache the post-header-injection
+    // response so cache hits carry CSP/nosniff/etc.
     if (cacheable && res.status === 200 && ct.includes("text/html")) {
       ctx.waitUntil(cache.put(request, res.clone()));
     }
