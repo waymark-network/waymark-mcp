@@ -1136,6 +1136,8 @@ function driftPage(events: DriftEvent[]): string {
 <meta property="og:title" content="API Drift Tracker — APIs that just broke your AI agents">
 <meta property="og:description" content="Waymark re-verifies thousands of API routes against live endpoints. When an API changes and breaks agents on stale knowledge, it shows up here first.">
 <meta property="og:type" content="website"><meta name="twitter:card" content="summary_large_image">
+<meta property="og:image" content="https://waymark.network/og.png">
+<meta name="twitter:image" content="https://waymark.network/og.png">
 <link rel="canonical" href="https://mcp.waymark.network/drift">
 <style>:root{--bg:#0b0e14;--panel:#131826;--line:#1f2840;--text:#e6ebf4;--dim:#8b96ad;--teal:#5eead4;--indigo:#818cf8;--gold:#fbbf24;--bad:#f87171;--good:#34d399}
 *{box-sizing:border-box;margin:0}body{background:var(--bg);color:var(--text);font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:820px;margin:0 auto;padding:0 24px 70px}
@@ -1252,6 +1254,8 @@ function contributorsPage(data: ContributorStat[]): string {
 <meta property="og:title" content="Waymark contributors — who's mapping the agent economy">
 <meta property="og:description" content="Routes authored, domains covered, and attestation outcomes per contributor. Trust is earned by consensus — here's the leaderboard.">
 <meta property="og:type" content="website"><meta name="twitter:card" content="summary_large_image">
+<meta property="og:image" content="https://waymark.network/og.png">
+<meta name="twitter:image" content="https://waymark.network/og.png">
 <link rel="canonical" href="https://mcp.waymark.network/contributors">
 <style>:root{--bg:#0b0e14;--panel:#131826;--line:#1f2840;--text:#e6ebf4;--dim:#8b96ad;--teal:#5eead4;--indigo:#818cf8;--gold:#fbbf24;--bad:#f87171;--good:#34d399}
 *{box-sizing:border-box;margin:0}body{background:var(--bg);color:var(--text);font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:900px;margin:0 auto;padding:0 24px 70px}
@@ -1449,7 +1453,9 @@ async function routesBrowsePage(env: Env): Promise<Response> {
 <meta property="og:title" content="Browse ${idx.length} agent routes — Waymark">
 <meta property="og:description" content="${escapeHtml(desc)}">
 <meta property="og:url" content="${pageUrl}">
-<meta name="twitter:card" content="summary">
+<meta property="og:image" content="https://waymark.network/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://waymark.network/og.png">
 <meta name="twitter:title" content="Browse ${idx.length} agent routes — Waymark">
 <meta name="twitter:description" content="${escapeHtml(desc)}">
 <script type="application/ld+json">${jsonLdSafe(breadcrumbLd)}</script>
@@ -1548,7 +1554,9 @@ async function routeDomainPage(env: Env, slugRaw: string): Promise<Response> {
 <meta property="og:title" content="${t} — agent routes">
 <meta property="og:description" content="${escapeHtml(desc)}">
 <meta property="og:url" content="${pageUrl}">
-<meta name="twitter:card" content="summary">
+<meta property="og:image" content="https://waymark.network/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://waymark.network/og.png">
 <meta name="twitter:title" content="${t} — agent routes | Waymark">
 <meta name="twitter:description" content="${escapeHtml(desc)}">
 <script type="application/ld+json">${jsonLdSafe(breadcrumbLd)}</script>
@@ -1725,7 +1733,9 @@ async function routePage(env: Env, id: string): Promise<Response> {
 <meta property="og:title" content="${t} — ${titleKind}">
 <meta property="og:description" content="${desc}">
 <meta property="og:url" content="${pageUrl}">
-<meta name="twitter:card" content="summary">
+<meta property="og:image" content="https://waymark.network/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://waymark.network/og.png">
 <meta name="twitter:title" content="${t} — ${titleKind} | Waymark">
 <meta name="twitter:description" content="${desc}">
 <script type="application/ld+json">${jsonLdSafe(jsonLd)}</script>
