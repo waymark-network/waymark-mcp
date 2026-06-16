@@ -149,6 +149,27 @@ async function patchIndex(env: Env, fn: (idx: IdxEntry[]) => IdxEntry[]): Promis
   } catch { /* rebuildable */ }
 }
 
+/** Per-isolate memo of the corpus scale (total routes + distinct domains).
+ * The /r/{id} CTA count was the single most expensive op on the largest
+ * crawlable surface (6,440 server-rendered pages): each render read AND
+ * JSON.parsed the full ~1.3 MB fat index just to print a cosmetic
+ * "X,400+ more routes across X,X00+ domains" line that rounds DOWN to the
+ * nearest 100 (so it only changes every ~100 routes, ~1 h at current growth).
+ * Memoizing per-isolate with a short TTL lets a warm isolate serve many route
+ * pages off one index read instead of one read per hit. Read-only and purely
+ * cosmetic: worst case the count is ≤TTL stale and rounds down, so it can only
+ * ever under-promise — never over-claim. No write path is touched, and the
+ * caller still falls back to the durable "thousands more" phrasing on error. */
+let scaleMemo: { routeCount: number; domainCount: number; at: number } | null = null;
+const SCALE_MEMO_TTL_MS = 300_000; // 5 min — matches the route page's own max-age=300 freshness contract
+async function getScaleCounts(env: Env): Promise<{ routeCount: number; domainCount: number }> {
+  const now = Date.now();
+  if (scaleMemo && now - scaleMemo.at < SCALE_MEMO_TTL_MS) return scaleMemo;
+  const idx = await getIndex(env);
+  scaleMemo = { routeCount: idx.length, domainCount: new Set(idx.map((e) => e.domain)).size, at: now };
+  return scaleMemo;
+}
+
 const bigrams = (tokens: string[]) => {
   const out = new Set<string>();
   for (let i = 0; i < tokens.length - 1; i++) out.add(tokens[i] + " " + tokens[i + 1]);
@@ -1693,16 +1714,17 @@ async function routePage(env: Env, id: string): Promise<Response> {
   // and undercounted the corpus ~30× (6.4k routes) — a 30× under-claim on the most
   // shareable/indexable surface, and stale the moment a route is added. Derive it
   // from the served index instead, rounded DOWN to a clean floor so it can only
-  // ever under-promise (never over-claim) and never needs hand-maintenance. Durable
-  // word-fallback if the index read fails, so the CTA never renders a broken number.
+  // ever under-promise (never over-claim) and never needs hand-maintenance. The
+  // counts come from getScaleCounts(), a per-isolate ≤5 min memo, so this hot path
+  // no longer reads + JSON.parses the full ~1.3 MB fat index on every render.
+  // Durable word-fallback if the read fails, so the CTA never renders a broken number.
   let scaleMore = "thousands more";
   let scaleDomains = "";
   try {
-    const idx = await getIndex(env);
-    const others = Math.max(0, idx.length - 1);
+    const { routeCount, domainCount } = await getScaleCounts(env);
+    const others = Math.max(0, routeCount - 1);
     if (others >= 100) {
       scaleMore = `${(Math.floor(others / 100) * 100).toLocaleString("en-US")}+ more`;
-      const domainCount = new Set(idx.map((e) => e.domain)).size;
       if (domainCount >= 100) scaleDomains = ` across ${(Math.floor(domainCount / 100) * 100).toLocaleString("en-US")}+ domains`;
     }
   } catch { /* fall back to the durable "thousands more" phrasing */ }
