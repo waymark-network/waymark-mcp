@@ -1452,7 +1452,7 @@ async function routesBrowsePage(env: Env): Promise<Response> {
 <meta name="twitter:card" content="summary">
 <meta name="twitter:title" content="Browse ${idx.length} agent routes — Waymark">
 <meta name="twitter:description" content="${escapeHtml(desc)}">
-<script type="application/ld+json">${JSON.stringify(breadcrumbLd)}</script>
+<script type="application/ld+json">${jsonLdSafe(breadcrumbLd)}</script>
 <style>:root{--bg:#0b0e14;--panel:#131826;--line:#1f2840;--text:#e6ebf4;--dim:#8b96ad;--accent:#5eead4;--warn:#fbbf24;--good:#34d399}
 *{box-sizing:border-box;margin:0}body{background:var(--bg);color:var(--text);font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:860px;margin:0 auto;padding:24px}
 a{color:var(--accent)}h1{font-size:26px;line-height:1.3;margin:18px 0 6px}.meta{color:var(--dim);font-size:14px;margin-bottom:20px}
@@ -1551,7 +1551,7 @@ async function routeDomainPage(env: Env, slugRaw: string): Promise<Response> {
 <meta name="twitter:card" content="summary">
 <meta name="twitter:title" content="${t} — agent routes | Waymark">
 <meta name="twitter:description" content="${escapeHtml(desc)}">
-<script type="application/ld+json">${JSON.stringify(breadcrumbLd)}</script>
+<script type="application/ld+json">${jsonLdSafe(breadcrumbLd)}</script>
 <style>:root{--bg:#0b0e14;--panel:#131826;--line:#1f2840;--text:#e6ebf4;--dim:#8b96ad;--accent:#5eead4;--warn:#fbbf24;--good:#34d399}
 *{box-sizing:border-box;margin:0}body{background:var(--bg);color:var(--text);font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:860px;margin:0 auto;padding:24px}
 a{color:var(--accent)}h1{font-size:26px;line-height:1.3;margin:18px 0 6px}.meta{color:var(--dim);font-size:14px;margin-bottom:20px}
@@ -1589,6 +1589,24 @@ q.addEventListener("input",function(){
 
 const escapeHtml = (s: string) =>
   s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] as string));
+
+/** Serialize an object for safe embedding inside an inline
+ *  <script type="application/ld+json"> block. JSON.stringify does NOT escape "<"
+ *  or "/", so a community-contributed field (route.task/domain/steps — all
+ *  self-serve-contributable) containing the literal "</script>" would close the
+ *  script element early and inject arbitrary HTML/JS into the server-rendered
+ *  page (stored XSS on every /r/{id}, /routes, /routes/{slug} surface — the most
+ *  indexable/shareable ones). Escaping <, >, & and the U+2028/U+2029 line
+ *  separators to their \uXXXX forms is the canonical mitigation: the output stays
+ *  byte-for-byte valid JSON (parsers decode the escapes back), but "</script>"
+ *  can no longer appear literally, so breakout is impossible. */
+const jsonLdSafe = (obj: unknown): string =>
+  JSON.stringify(obj)
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
+    .replace(/&/g, "\\u0026")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
 
 /** Stable URL slug for a domain — powers the bounded /routes/{slug} per-domain
  *  pages (item 6c) and the internal links that point at them. */
@@ -1710,8 +1728,8 @@ async function routePage(env: Env, id: string): Promise<Response> {
 <meta name="twitter:card" content="summary">
 <meta name="twitter:title" content="${t} — ${titleKind} | Waymark">
 <meta name="twitter:description" content="${desc}">
-<script type="application/ld+json">${JSON.stringify(jsonLd)}</script>
-<script type="application/ld+json">${JSON.stringify(breadcrumbLd)}</script>
+<script type="application/ld+json">${jsonLdSafe(jsonLd)}</script>
+<script type="application/ld+json">${jsonLdSafe(breadcrumbLd)}</script>
 <style>:root{--bg:#0b0e14;--panel:#131826;--line:#1f2840;--text:#e6ebf4;--dim:#8b96ad;--accent:#5eead4;--warn:#fbbf24;--good:#34d399}
 *{box-sizing:border-box;margin:0}body{background:var(--bg);color:var(--text);font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:760px;margin:0 auto;padding:24px}
 a{color:var(--accent)}h1{font-size:26px;line-height:1.3;margin:18px 0 6px}.meta{color:var(--dim);font-size:14px;margin-bottom:10px}
