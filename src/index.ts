@@ -1489,18 +1489,41 @@ async function activityEndpoint(env: Env, limit: number): Promise<Response> {
 /** Public JSON search over the route map (powers the site playground). */
 async function searchEndpoint(env: Env, q: string, ctx: ExecutionContext): Promise<Response> {
   if (!q.trim()) return Response.json({ routes: [] }, { headers: CORS });
-  const t0 = Date.now();
-  const routes = await retrieve(env, q, undefined, 5);
-  const retrievalMs = Date.now() - t0;
-  const ranked = routes.map((r) => ({
-      id: r.id, task: r.task, domain: r.domain,
-      steps: r.steps, gotchas: r.gotchas,
-      success: r.attestations.success, failure: r.attestations.failure,
-      verification: r.verification ?? { status: "sampled", method: "legacy-file-sample" },
-      url: `https://mcp.waymark.network/r/${r.id}`,
-    }));
+  // Cache the *billed Vectorize retrieval result* (not the whole response) keyed
+  // by the normalized query, so repeated identical /search queries — crawlers,
+  // social unfurlers, the smoke suite's own 2x/run probes, and naive floods —
+  // skip the per-hit Vectorize spend. robots.txt (item 37) only *asks* polite
+  // bots to avoid /search; this is the server-side cost defense. Crucially we
+  // still logEvent() on EVERY hit, so demand telemetry and the smoke
+  // telemetry-liveness check (item 22, which depends on each /search writing a
+  // query event) are unaffected — only the expensive retrieve() is deduped. TTL
+  // 60s == the response's existing downstream max-age, so no extra staleness.
+  const cache = (caches as unknown as { default: Cache }).default;
+  const norm = q.trim().toLowerCase().slice(0, 256);
+  const cacheKey = new Request(`https://mcp.waymark.network/__searchcache?q=${encodeURIComponent(norm)}`);
+  let ranked: unknown[] | null = null;
+  let retrievalMs = -1; // -1 signals a retrieval-cache hit (no Vectorize query ran)
+  const cached = await cache.match(cacheKey);
+  if (cached) {
+    try { ranked = await cached.json(); } catch { ranked = null; }
+  }
+  if (!ranked) {
+    const t0 = Date.now();
+    const routes = await retrieve(env, q, undefined, 5);
+    retrievalMs = Date.now() - t0;
+    ranked = routes.map((r) => ({
+        id: r.id, task: r.task, domain: r.domain,
+        steps: r.steps, gotchas: r.gotchas,
+        success: r.attestations.success, failure: r.attestations.failure,
+        verification: r.verification ?? { status: "sampled", method: "legacy-file-sample" },
+        url: `https://mcp.waymark.network/r/${r.id}`,
+      }));
+    // Store the ranked array (not the CORS response) with a positive max-age so
+    // caches.default actually retains it; key is never dispatched, only matched.
+    ctx.waitUntil(cache.put(cacheKey, Response.json(ranked, { headers: { "Cache-Control": "public, max-age=60" } })));
+  }
   ctx.waitUntil(logEvent(env, "query", { task: q.slice(0, 140), domain: "web-playground", results: ranked.length, ms: retrievalMs }));
-  return Response.json({ routes: ranked }, { headers: { ...CORS, "Cache-Control": "public, max-age=60" } });
+  return Response.json({ routes: ranked }, { headers: { ...CORS, "Cache-Control": "public, max-age=60", "X-Search-Cache": retrievalMs < 0 ? "hit" : "miss" } });
 }
 
 /** Server-rendered directory of route domains (SEO + humans). Each domain links
