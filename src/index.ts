@@ -2138,7 +2138,7 @@ footer a{color:var(--teal);text-decoration:none}
 
 <script>
 var $=function(id){return document.getElementById(id)};
-function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]})}
+function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
 function ago(t){var d=(Date.now()-new Date(t))/1000;if(d<60)return Math.floor(d)+"s ago";if(d<3600)return Math.floor(d/60)+"m ago";if(d<86400)return Math.floor(d/3600)+"h ago";return Math.floor(d/86400)+"d ago"}
 
 /* ── CONSTELLATION BACKGROUND ── */
@@ -2294,6 +2294,8 @@ function applyDomainFilter(){
   }
 }
 document.addEventListener("click",function(e){
+  var row=e.target&&e.target.closest?e.target.closest(".route-row"):null;
+  if(row){var h=row.getAttribute("data-href");if(h)window.open(h,"_blank","noopener");return;}
   var c=e.target&&e.target.closest?e.target.closest(".fchip"):null;
   if(!c)return;
   activeDomain=c.getAttribute("data-d")||"";
@@ -2355,7 +2357,7 @@ function load(){
     $("routes").tBodies[0].innerHTML=r.routes.map(function(x){
       var rate=x.success_rate===null?null:Math.round(x.success_rate*100);
       var url="https://mcp.waymark.network/r/"+esc(x.id||"");
-      return "<tr class='route-row' data-domain=\\""+esc(x.domain||"")+"\\" onclick=\\"window.open('"+url+"','_blank')\\">"
+      return "<tr class='route-row' data-domain=\\""+esc(x.domain||"")+"\\" data-href=\\""+url+"\\">"
         +"<td>"+esc(x.task)+"</td>"
         +"<td><span class='chip'>"+esc(x.domain)+"</span></td>"
         +"<td class='mono'>"+x.steps+"</td>"
