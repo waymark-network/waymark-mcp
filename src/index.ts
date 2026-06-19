@@ -1312,6 +1312,7 @@ function driftPage(events: DriftEvent[]): string {
 <meta name="twitter:image" content="https://waymark.network/og.png">
 <link rel="canonical" href="https://mcp.waymark.network/drift">
 <link rel="alternate" type="application/rss+xml" title="Waymark API Drift Tracker" href="https://mcp.waymark.network/drift.xml">
+<link rel="alternate" type="application/json" title="Waymark API Drift Tracker (JSON)" href="https://mcp.waymark.network/drift.json">
 <style>:root{--bg:#0b0e14;--panel:#131826;--line:#1f2840;--text:#e6ebf4;--dim:#8b96ad;--teal:#5eead4;--indigo:#818cf8;--gold:#fbbf24;--bad:#f87171;--good:#34d399}
 *{box-sizing:border-box;margin:0}body{background:var(--bg);color:var(--text);font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:820px;margin:0 auto;padding:0 24px 70px}
 a{color:var(--teal);text-decoration:none}a:hover{text-decoration:underline}
@@ -1430,6 +1431,7 @@ function contributorsPage(data: ContributorStat[]): string {
 <meta property="og:image" content="https://waymark.network/og.png">
 <meta name="twitter:image" content="https://waymark.network/og.png">
 <link rel="canonical" href="https://mcp.waymark.network/contributors">
+<link rel="alternate" type="application/json" title="Waymark contributors (JSON)" href="https://mcp.waymark.network/contributors.json">
 <style>:root{--bg:#0b0e14;--panel:#131826;--line:#1f2840;--text:#e6ebf4;--dim:#8b96ad;--teal:#5eead4;--indigo:#818cf8;--gold:#fbbf24;--bad:#f87171;--good:#34d399}
 *{box-sizing:border-box;margin:0}body{background:var(--bg);color:var(--text);font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:900px;margin:0 auto;padding:0 24px 70px}
 a{color:var(--teal);text-decoration:none}a:hover{text-decoration:underline}
@@ -1925,6 +1927,7 @@ async function routePage(env: Env, id: string): Promise<Response> {
 <title>${t} — ${titleKind} | Waymark</title>
 <meta name="description" content="${desc}">
 <link rel="canonical" href="${pageUrl}">
+<link rel="alternate" type="application/json" title="This route as JSON" href="${pageUrl}.json">
 <meta property="og:type" content="article">
 <meta property="og:site_name" content="Waymark">
 <meta property="og:title" content="${t} — ${titleKind}">
