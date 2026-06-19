@@ -1084,8 +1084,9 @@ export default {
       return activityEndpoint(env, limit);
     }
     if (pathname === "/freshness") return freshnessEndpoint(env);
-    if (pathname === "/drift") return driftEndpoint(env, false);
-    if (pathname === "/drift.json") return driftEndpoint(env, true);
+    if (pathname === "/drift") return driftEndpoint(env, "html");
+    if (pathname === "/drift.json") return driftEndpoint(env, "json");
+    if (pathname === "/drift.xml" || pathname === "/drift.rss") return driftEndpoint(env, "rss");
     if (pathname === "/admin/drift" && request.method === "POST") {
       return recordDrift(env, request);
     }
@@ -1230,12 +1231,63 @@ async function loadDrift(env: Env, limit = 100): Promise<DriftEvent[]> {
   return vals.filter((v): v is string => v !== null).map((v) => JSON.parse(v));
 }
 
-async function driftEndpoint(env: Env, asJson: boolean): Promise<Response> {
+async function driftEndpoint(env: Env, fmt: "html" | "json" | "rss" = "html"): Promise<Response> {
   const events = await loadDrift(env, 200);
-  if (asJson) {
+  if (fmt === "json") {
     return Response.json({ count: events.length, drift: events }, { headers: { ...CORS, "Cache-Control": "public, max-age=600" } });
   }
+  if (fmt === "rss") {
+    // RSS 2.0 so the drift changelog can be subscribed to the way any changelog
+    // should be — feed readers, Slack/Discord/Teams RSS apps, Zapier/IFTTT. The
+    // drift tracker is the property's "subscribe to breaking API changes" surface;
+    // a JSON feed alone can't be added to a feed reader. Read-only + additive.
+    return new Response(driftFeed(events), { headers: { ...CORS, "Content-Type": "application/rss+xml;charset=utf-8", "Cache-Control": "public, max-age=600" } });
+  }
   return new Response(driftPage(events), { headers: { "Content-Type": "text/html;charset=utf-8", "Cache-Control": "public, max-age=600" } });
+}
+
+// XML-safe escaper (distinct from esc2/escapeHtml — XML needs &apos; not &#39;
+// to stay valid under strict feed parsers; all five predefined entities covered).
+const xmlEsc = (s: string) =>
+  String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;" }[c] as string));
+
+/** RSS 2.0 feed of drift events, newest first. Read-only view over loadDrift(). */
+function driftFeed(events: DriftEvent[]): string {
+  const SELF = "https://mcp.waymark.network/drift.xml";
+  const PAGE = "https://mcp.waymark.network/drift";
+  const rfc822 = (iso: string) => { const d = new Date(iso); return isNaN(d.getTime()) ? new Date().toUTCString() : d.toUTCString(); };
+  const built = events.length ? rfc822(events[0].t) : new Date().toUTCString();
+  const items = events.map((e) => {
+    const link = e.route_id ? `https://mcp.waymark.network/r/${e.route_id}` : PAGE;
+    const title = `${e.domain}: ${e.what}`.slice(0, 140);
+    const descParts = [e.what, `Impact: ${e.impact}`];
+    if (e.fix) descParts.push(`Fix: ${e.fix}`);
+    descParts.push(`Source: ${e.source}`);
+    // guid is a stable, opaque identity (not a resolvable URL) so a re-published
+    // route_id can't collapse two distinct drift events into one feed entry.
+    const guid = `waymark-drift:${e.domain}:${e.t}`;
+    return `<item>
+<title>${xmlEsc(title)}</title>
+<link>${xmlEsc(link)}</link>
+<guid isPermaLink="false">${xmlEsc(guid)}</guid>
+<pubDate>${rfc822(e.t)}</pubDate>
+<category>${xmlEsc(e.domain)}</category>
+<description>${xmlEsc(descParts.join(" — "))}</description>
+</item>`;
+  }).join("\n");
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+<channel>
+<title>Waymark API Drift Tracker</title>
+<link>${PAGE}</link>
+<atom:link href="${SELF}" rel="self" type="application/rss+xml"/>
+<description>Real API changes that silently break AI agents running on stale knowledge — detected by Waymark's canary fleet re-verifying routes against live APIs.</description>
+<language>en-us</language>
+<lastBuildDate>${built}</lastBuildDate>
+<ttl>60</ttl>
+${items}
+</channel>
+</rss>`;
 }
 
 const esc2 = (s: string) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] as string));
@@ -1259,6 +1311,7 @@ function driftPage(events: DriftEvent[]): string {
 <meta property="og:image" content="https://waymark.network/og.png">
 <meta name="twitter:image" content="https://waymark.network/og.png">
 <link rel="canonical" href="https://mcp.waymark.network/drift">
+<link rel="alternate" type="application/rss+xml" title="Waymark API Drift Tracker" href="https://mcp.waymark.network/drift.xml">
 <style>:root{--bg:#0b0e14;--panel:#131826;--line:#1f2840;--text:#e6ebf4;--dim:#8b96ad;--teal:#5eead4;--indigo:#818cf8;--gold:#fbbf24;--bad:#f87171;--good:#34d399}
 *{box-sizing:border-box;margin:0}body{background:var(--bg);color:var(--text);font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:820px;margin:0 auto;padding:0 24px 70px}
 a{color:var(--teal);text-decoration:none}a:hover{text-decoration:underline}
@@ -1288,7 +1341,7 @@ ${events.length ? rows : `<div class="empty">No drift detected in the current wi
 <div class="cta"><h2>Stop your agents from running on stale API knowledge</h2>
 <p style="color:var(--dim);font-size:14px">Waymark gives any agent live, continuously re-checked routes — the current way to call every API, with the gotchas that just changed. One MCP install:</p>
 <code>claude mcp add --transport http waymark https://mcp.waymark.network/mcp</code></div>
-<footer>Waymark — the shared, self-verifying route map for AI agents · a service of MC Software, LLC · <a href="/drift.json">JSON feed</a></footer>
+<footer>Waymark — the shared, self-verifying route map for AI agents · a service of MC Software, LLC · <a href="/drift.json">JSON feed</a> · <a href="/drift.xml">RSS</a></footer>
 </body></html>`;
 }
 
@@ -1966,7 +2019,7 @@ Install (Claude Code): claude mcp add --transport http waymark https://mcp.wayma
 - Per-route record (JSON): https://mcp.waymark.network/r/{id}.json
 - Routes (JSON, paginated 100/page — add ?page=N up to 65 pages, or ?all=1 for the full ~6.4k-route set): https://mcp.waymark.network/routes
 - Routes browsable by domain (HTML): https://mcp.waymark.network/routes/{domain-slug}
-- API drift tracker (real API changes that silently break agents on stale knowledge; JSON feed at /drift.json): https://mcp.waymark.network/drift
+- API drift tracker (real API changes that silently break agents on stale knowledge; JSON feed at /drift.json, RSS feed at /drift.xml): https://mcp.waymark.network/drift
 - Contributors leaderboard (JSON feed at /contributors.json): https://mcp.waymark.network/contributors
 - Stats: https://mcp.waymark.network/stats
 - Benchmark (blind-graded, +45% first-try success): https://waymark.network/benchmark
