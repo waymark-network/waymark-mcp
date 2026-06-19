@@ -224,6 +224,35 @@ async function fetchRoutes(env: Env, ids: string[]): Promise<Route[]> {
 const EMBED_MODEL = "@cf/baai/bge-base-en-v1.5";
 const VEC_MIN_SCORE = 0.56; // calibrated: exact ~0.94, paraphrase ~0.60+, garbage ≤0.49
 
+/* Vector-path grounding gate (refusal hardening, 2026-06-19).
+ * As the corpus grew (3.8k→6.4k routes), the bge ranker began returning
+ * semantically-incoherent matches *just over* VEC_MIN_SCORE for keyword-salad
+ * queries that happen to contain real technical-adjacent words — e.g.
+ * "asdf qwerty zxcv random nonsense tokens here" returns vLLM / SCTE-35 /
+ * OpenVEX / OPA / e-invoicing routes that share NO content word with the query.
+ * (This is now the real false-serve path; the keyword fallback already refuses
+ * it — SPECS-deploy-gated's rankIndex fix is obsolete for this case.) Since "a
+ * wrong route is worse than no route", below a high-confidence score we require
+ * a served route to share ≥1 content token (>3 chars) with the query, or exactly
+ * match the domain hint. Verified offline against the live 6,440-route corpus:
+ * all 20 golden + 18 refusal retrieval pairs are grounded (0 at risk); the
+ * false-serve garbage query shares 0 content tokens with every one of its
+ * matches, so it is fully gated. Near-exact matches (≥VEC_HIGH_CONF) bypass the
+ * check so genuine pure-semantic hits still serve. */
+const VEC_HIGH_CONF = 0.66; // near-exact only; paraphrases (~0.60) rely on grounding (they have it)
+const contentTokens = (s: string) =>
+  new Set(s.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length > 3));
+function lexicallyGrounded(query: string, domainHint: string | undefined) {
+  const q = contentTokens(query + " " + (domainHint ?? ""));
+  const dh = domainHint?.toLowerCase();
+  return (r: Route): boolean => {
+    if (dh && r.domain.toLowerCase() === dh) return true;
+    const rt = contentTokens(r.task + " " + r.domain);
+    for (const t of q) if (rt.has(t)) return true;
+    return false;
+  };
+}
+
 /* Trust gate for self-serve contributions (v0.6 security review BLOCKER #1):
  * a community route is verification:"unverified" until the canary re-checks it
  * against live docs. Unverified routes MUST NOT be served as authoritative, or
@@ -260,11 +289,20 @@ async function retrieve(env: Env, query: string, domainHint: string | undefined,
     if (cand.length > 0) {
       const routes = await fetchRoutes(env, cand.map((m) => m.id));
       if (routes.length > 0) {
-        // BLOCKER #1: re-rank by verification-adjusted score so a verified route
-        // always outranks an unverified one at similar semantic distance.
         const score = new Map(cand.map((m) => [m.id, m.score]));
-        routes.sort((a, b) => servingScore(b, score.get(b.id) ?? 0) - servingScore(a, score.get(a.id) ?? 0));
-        return routes.slice(0, limit);
+        // Refusal gate: drop incoherent low-confidence matches that share no
+        // content word with the query (keyword-salad false serves). High-conf
+        // matches bypass so genuine pure-semantic hits still serve.
+        const grounded = lexicallyGrounded(query, domainHint);
+        const kept = routes.filter((r) => (score.get(r.id) ?? 0) >= VEC_HIGH_CONF || grounded(r));
+        if (kept.length > 0) {
+          // BLOCKER #1: re-rank by verification-adjusted score so a verified route
+          // always outranks an unverified one at similar semantic distance.
+          kept.sort((a, b) => servingScore(b, score.get(b.id) ?? 0) - servingScore(a, score.get(a.id) ?? 0));
+          return kept.slice(0, limit);
+        }
+        // else: everything was ungrounded low-confidence → fall through to the
+        // keyword path (also gated), which refuses true garbage.
       }
     }
     // Semantic miss with a domain hint can still have an exact keyword match.
