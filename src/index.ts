@@ -1142,6 +1142,9 @@ export default {
     if (pathname === "/llms.txt") {
       return new Response(LLMS_TXT, { headers: { "Content-Type": "text/plain;charset=utf-8", "Cache-Control": "public, max-age=3600" } });
     }
+    if (pathname === "/openapi.json") {
+      return new Response(JSON.stringify(openApiSpec(env)), { headers: { ...CORS, "Content-Type": "application/json", "Cache-Control": "public, max-age=3600" } });
+    }
     // v0.6 — self-serve contributor keys + demand dashboard
     if (pathname === "/v1/keys" && request.method === "POST") return issueKeyHttp(env, request);
     if (pathname === "/admin/revoke-key" && request.method === "POST") return revokeKey(env, request.headers.get("x-write-key"), request);
@@ -2027,7 +2030,165 @@ Install (Claude Code): claude mcp add --transport http waymark https://mcp.wayma
 - Stats: https://mcp.waymark.network/stats
 - Benchmark (blind-graded, +45% first-try success): https://waymark.network/benchmark
 - Registry entry: network.waymark/server (official MCP registry)
+- OpenAPI 3.1 description of the read/HTTP API: https://mcp.waymark.network/openapi.json
 `;
+
+/* ------------------------------------------------------------------ */
+/* OpenAPI 3.1 service description for the public HTTP API.            */
+/* The agent-facing primary interface is MCP (/mcp, streamable-HTTP),  */
+/* but the read endpoints (and self-serve key issuance) are a plain    */
+/* JSON HTTP API documented for humans at /docs and listed in          */
+/* /llms.txt — yet there was no machine-consumable service description */
+/* a tool, codegen, or LLM function-calling layer could ingest. This   */
+/* spec is built from the live response shapes (verified against the   */
+/* deployed endpoints) and stays version-DRY via env.SERVER_VERSION.   */
+/* Read-only + additive: it documents existing behaviour, changes none */
+/* of it. The MCP transport is intentionally NOT modelled as REST      */
+/* paths (it is JSON-RPC over a single POST) — it is pointed to via    */
+/* externalDocs and the description instead.                           */
+function openApiSpec(env: Env) {
+  const BASE = env.PUBLIC_URL;
+  return {
+    openapi: "3.1.0",
+    info: {
+      title: "Waymark HTTP API",
+      version: env.SERVER_VERSION,
+      summary: "Read API for the Waymark agent procedural-knowledge network.",
+      description:
+        "Public HTTP/JSON API for Waymark — the shared, self-verifying route map for AI agents. " +
+        "The primary agent interface is the MCP server (streamable-HTTP at /mcp; tools waymark_query, " +
+        "waymark_register, waymark_contribute, waymark_attest). These REST endpoints expose the same " +
+        "underlying data for tools, crawlers, and codegen. Trust model: a route's `verification.status` " +
+        "(provenance/fact-check axis) is distinct from its attestation consensus (success/failure counts); " +
+        "no route is blanket \"verified\".",
+      contact: { name: "Waymark security", url: "https://waymark.network/trust", email: "security@waymark.network" },
+      license: { name: "Apache-2.0", identifier: "Apache-2.0" },
+    },
+    servers: [{ url: BASE }],
+    externalDocs: { description: "Integration guide + MCP setup", url: "https://waymark.network/docs" },
+    paths: {
+      "/search": {
+        get: {
+          operationId: "search",
+          summary: "Semantic route search",
+          description:
+            "Returns up to 5 task routes matching a natural-language query, ranked by embedding similarity " +
+            "with a confidence floor (returns an empty list rather than a low-confidence wrong route).",
+          parameters: [
+            { name: "q", in: "query", required: true, description: "Natural-language task description.", schema: { type: "string", maxLength: 256 } },
+          ],
+          responses: {
+            "200": {
+              description: "Ranked routes (possibly empty on a low-confidence/no-match query).",
+              headers: { "X-Search-Cache": { description: "`hit` if the retrieval result was served from edge cache, else `miss`.", schema: { type: "string", enum: ["hit", "miss"] } } },
+              content: { "application/json": { schema: { type: "object", required: ["routes"], properties: { routes: { type: "array", items: { $ref: "#/components/schemas/RouteResult" } } } } } },
+            },
+          },
+        },
+      },
+      "/r/{id}.json": {
+        get: {
+          operationId: "getRoute",
+          summary: "Full route record",
+          parameters: [{ name: "id", in: "path", required: true, description: "Route UUID.", schema: { type: "string", format: "uuid" } }],
+          responses: {
+            "200": { description: "The route record.", content: { "application/json": { schema: { $ref: "#/components/schemas/RouteRecord" } } } },
+            "404": { description: "No route with that id.", content: { "application/json": { schema: { $ref: "#/components/schemas/NotFound" } } } },
+          },
+        },
+      },
+      "/stats": {
+        get: {
+          operationId: "getStats",
+          summary: "Corpus + traffic counters",
+          responses: { "200": { description: "Aggregate counters.", content: { "application/json": { schema: { $ref: "#/components/schemas/Stats" } } } } },
+        },
+      },
+      "/freshness": {
+        get: {
+          operationId: "getFreshness",
+          summary: "Route freshness + re-verify priority",
+          description: "Time-decayed trust per route (60-day half-life), bucket counts, and the stalest-first re-verify queue the canary fleet drains.",
+          responses: { "200": { description: "Freshness report.", content: { "application/json": { schema: { $ref: "#/components/schemas/Freshness" } } } } },
+        },
+      },
+      "/drift.json": {
+        get: {
+          operationId: "getDrift",
+          summary: "API drift feed",
+          description: "Real, observed API changes that silently break agents running on stale knowledge. RSS 2.0 variant at /drift.xml.",
+          responses: { "200": { description: "Drift events, newest first.", content: { "application/json": { schema: { $ref: "#/components/schemas/DriftFeed" } } } } },
+        },
+      },
+      "/contributors.json": {
+        get: {
+          operationId: "getContributors",
+          summary: "Contributor leaderboard",
+          responses: { "200": { description: "Contributors by route count.", content: { "application/json": { schema: { $ref: "#/components/schemas/Contributors" } } } } },
+        },
+      },
+      "/v1/keys": {
+        post: {
+          operationId: "issueContributorKey",
+          summary: "Mint a free contributor key (no auth)",
+          description: "One call returns a contributor API key used as `api_key` in waymark_contribute. Per-IP and network-wide hourly rate limits apply.",
+          requestBody: { required: true, content: { "application/json": { schema: { type: "object", required: ["handle"], properties: { handle: { type: "string", minLength: 2, maxLength: 60, description: "Contributor handle: letters, digits, space, _ . - / @." } } } } } },
+          responses: {
+            "200": { description: "Key issued (shown once).", content: { "application/json": { schema: { type: "object", required: ["api_key", "handle"], properties: { api_key: { type: "string", description: "Contributor key (prefix wmk_). Store it now — not retrievable later." }, handle: { type: "string" }, note: { type: "string" } } } } } },
+            "400": { description: "Invalid or reserved handle.", content: { "application/json": { schema: { $ref: "#/components/schemas/ApiError" } } } },
+            "429": { description: "Rate limited (per-IP or network-wide).", content: { "application/json": { schema: { $ref: "#/components/schemas/ApiError" } } } },
+          },
+        },
+      },
+    },
+    components: {
+      schemas: {
+        Verification: { type: "object", description: "Provenance/fact-check axis — distinct from attestation consensus.", properties: { status: { type: "string", example: "sampled" }, method: { type: "string" } } },
+        RouteResult: {
+          type: "object", description: "A route as returned by /search (trimmed for ranking responses).",
+          required: ["id", "task", "domain", "steps", "url"],
+          properties: {
+            id: { type: "string", format: "uuid" }, task: { type: "string" }, domain: { type: "string" },
+            steps: { type: "array", items: { type: "string" } }, gotchas: { type: "array", items: { type: "string" } },
+            success: { type: "integer" }, failure: { type: "integer" },
+            verification: { $ref: "#/components/schemas/Verification" }, url: { type: "string", format: "uri" },
+          },
+        },
+        RouteRecord: {
+          type: "object", description: "Full route record from /r/{id}.json.",
+          required: ["id", "task", "domain", "steps", "created", "attestations", "url"],
+          properties: {
+            id: { type: "string", format: "uuid" }, task: { type: "string" }, domain: { type: "string" },
+            steps: { type: "array", items: { type: "string" } }, gotchas: { type: "array", items: { type: "string" } },
+            contributor: { type: "string" }, created: { type: "string", format: "date-time" },
+            attestations: { type: "object", properties: { success: { type: "integer" }, failure: { type: "integer" }, last_attested: { type: ["string", "null"], format: "date-time" } } },
+            success_rate: { type: ["number", "null"], description: "success / (success+failure), or null if never attested." },
+            verification: { $ref: "#/components/schemas/Verification" }, url: { type: "string", format: "uri" },
+          },
+        },
+        Stats: { type: "object", properties: { routes: { type: "integer" }, attestations: { type: "integer" }, queries: { type: "integer" }, events_30d: { type: "integer" } } },
+        Freshness: {
+          type: "object",
+          properties: {
+            total: { type: "integer" }, half_life_days: { type: "integer" },
+            buckets: { type: "object", properties: { fresh: { type: "integer" }, aging: { type: "integer" }, stale: { type: "integer" }, never_attested: { type: "integer" } } },
+            reverify_priority: { type: "array", items: { type: "object", properties: { id: { type: "string", format: "uuid" }, task: { type: "string" }, domain: { type: "string" }, attestations: { type: "integer" }, last_days: { type: "integer" }, trust: { type: "number" }, freshness: { type: "number" }, decayed_trust: { type: "number" } } } },
+          },
+        },
+        DriftFeed: {
+          type: "object", required: ["count", "drift"],
+          properties: { count: { type: "integer" }, drift: { type: "array", items: { type: "object", properties: { t: { type: "string", format: "date-time" }, domain: { type: "string" }, api: { type: "string" }, what: { type: "string" }, impact: { type: "string" }, fix: { type: "string" }, route_id: { type: "string", format: "uuid" } } } } },
+        },
+        Contributors: {
+          type: "object", required: ["count", "contributors"],
+          properties: { count: { type: "integer" }, contributors: { type: "array", items: { type: "object", properties: { handle: { type: "string" }, routes: { type: "integer" }, domains: { type: "integer" }, top_domains: { type: "array", items: { type: "string" } }, attestations: { type: "integer" }, success: { type: "integer" }, failure: { type: "integer" }, success_rate: { type: ["number", "null"] }, verified_routes: { type: "integer" }, last_active: { type: ["string", "null"], format: "date-time" } } } } },
+        },
+        NotFound: { type: "object", required: ["error"], properties: { error: { type: "string", example: "not_found" }, id: { type: "string" } } },
+        ApiError: { type: "object", required: ["error"], properties: { error: { type: "string" } } },
+      },
+    },
+  };
+}
 
 /* ------------------------------------------------------------------ */
 /* Dashboard — single dark-themed page, zero external dependencies.    */
