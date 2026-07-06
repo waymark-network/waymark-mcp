@@ -2575,13 +2575,15 @@ document.addEventListener("click",function(e){
   applyDomainFilter();
 });
 
+/* Live loop (30s): stats + activity only — small payloads powering the health
+   pill, counters, pulse, feed, canary and demand map. The heavy route corpus
+   lives in loadRoutes() below on its own 5-min cadence (item 46). */
 function load(){
   Promise.all([
     fetch("https://mcp.waymark.network/stats").then(function(x){return x.json()}),
-    fetch("https://mcp.waymark.network/activity?limit=120").then(function(x){return x.json()}),
-    fetch("https://mcp.waymark.network/routes?all=1").then(function(x){return x.json()})
+    fetch("https://mcp.waymark.network/activity?limit=120").then(function(x){return x.json()})
   ]).then(function(res){
-    var s=res[0],a=res[1],r=res[2];
+    var s=res[0],a=res[1];
 
     /* Health pill */
     $("health").textContent="online";
@@ -2624,27 +2626,6 @@ function load(){
         "<span class='dim mono' style='font-size:11px'>"+ago(e.t)+"</span></div>";
     }).join(""):"<span class='dim'>No canary runs in the window yet — the fleet runs daily (and on demand).</span>";
 
-    /* Routes table — clickable rows linking to /r/{id} */
-    $("routes").tBodies[0].innerHTML=r.routes.map(function(x){
-      var rate=x.success_rate===null?null:Math.round(x.success_rate*100);
-      var url="https://mcp.waymark.network/r/"+esc(x.id||"");
-      return "<tr class='route-row' data-domain=\\""+esc(x.domain||"")+"\\" data-href=\\""+url+"\\">"
-        +"<td>"+esc(x.task)+"</td>"
-        +"<td><span class='chip'>"+esc(x.domain)+"</span></td>"
-        +"<td class='mono'>"+x.steps+"</td>"
-        +"<td><span class='ok'>"+x.success+"</span> <span class='dim'>/</span> <span class='fail'>"+x.failure+"</span></td>"
-        +"<td>"+(rate===null?"<span class='dim'>unrated</span>":"<span class='mono' style='font-size:11px;color:#9fe8d8'>"+rate+"%</span><div class='bar'><i style='width:"+rate+"%'></i></div>")+"</td>"
-        +"<td class='dim mono' style='font-size:11px'>"+(x.last_attested?ago(x.last_attested):"–")+"</td></tr>"}).join("");
-
-    /* Domain filter chips — top domains by route count */
-    var domCounts={};
-    r.routes.forEach(function(x){if(x.domain)domCounts[x.domain]=(domCounts[x.domain]||0)+1});
-    var domTop=Object.keys(domCounts).sort(function(p,q){return domCounts[q]-domCounts[p]||p.localeCompare(q)}).slice(0,12);
-    if(activeDomain&&domTop.indexOf(activeDomain)<0)activeDomain="";
-    $("domainChips").innerHTML='<span class="fchip'+(activeDomain===""?" active":"")+'" data-d="">All<span class="ct">'+r.routes.length+'</span></span>'+
-      domTop.map(function(d){return '<span class="fchip'+(d===activeDomain?" active":"")+'" data-d="'+esc(d)+'">'+esc(d)+'<span class="ct">'+domCounts[d]+'</span></span>'}).join("");
-    applyDomainFilter();
-
     /* Demand map — top queried domains + zero-result queries from /activity.
        Synthetic-traffic exclusion MIRRORS the worker's isSyntheticTraffic (~line 761)
        and the homepage's isRealDemand so all three surfaces report identical real
@@ -2670,7 +2651,50 @@ function load(){
       :"<div class='dim' style='padding:6px 0'>Every recent query found a route.</div>";
   }).catch(function(){$("health").textContent="fetch error";$("dotEl")&&($("dotEl").style.background="#fbbf24")});
 }
-load();setInterval(load,30000);
+/* Corpus loop (5 min + ETag gate): /routes?all=1 is ~2.3 MB across 6,400+
+   routes and changes at most hourly (often not for days), yet the old single
+   loop refetched it every 30s per open tab AND rebuilt all table rows each
+   poll — a full idx:routes read server-side + a multi-MB JSON.parse and a
+   6,000+-row innerHTML rebuild client-side, for a table that almost never
+   changed between polls. Now: fetch on load + every 300s; when the worker's
+   weak ETag (already exposed via Access-Control-Expose-Headers) matches the
+   last rendered corpus we skip the parse and the re-render entirely (the
+   worker answers the conditional revalidation with a 0-byte 304). Falls back
+   to a full render whenever the ETag is missing — never worse than before. */
+var routesEtag=null;
+function loadRoutes(){
+  fetch("https://mcp.waymark.network/routes?all=1").then(function(x){
+    var et=x.headers.get("ETag");
+    if(et&&et===routesEtag)return null; /* corpus unchanged — skip parse + render */
+    routesEtag=et;
+    return x.json();
+  }).then(function(r){
+    if(!r)return;
+
+    /* Routes table — clickable rows linking to /r/{id} */
+    $("routes").tBodies[0].innerHTML=r.routes.map(function(x){
+      var rate=x.success_rate===null?null:Math.round(x.success_rate*100);
+      var url="https://mcp.waymark.network/r/"+esc(x.id||"");
+      return "<tr class='route-row' data-domain=\\""+esc(x.domain||"")+"\\" data-href=\\""+url+"\\">"
+        +"<td>"+esc(x.task)+"</td>"
+        +"<td><span class='chip'>"+esc(x.domain)+"</span></td>"
+        +"<td class='mono'>"+x.steps+"</td>"
+        +"<td><span class='ok'>"+x.success+"</span> <span class='dim'>/</span> <span class='fail'>"+x.failure+"</span></td>"
+        +"<td>"+(rate===null?"<span class='dim'>unrated</span>":"<span class='mono' style='font-size:11px;color:#9fe8d8'>"+rate+"%</span><div class='bar'><i style='width:"+rate+"%'></i></div>")+"</td>"
+        +"<td class='dim mono' style='font-size:11px'>"+(x.last_attested?ago(x.last_attested):"–")+"</td></tr>"}).join("");
+
+    /* Domain filter chips — top domains by route count */
+    var domCounts={};
+    r.routes.forEach(function(x){if(x.domain)domCounts[x.domain]=(domCounts[x.domain]||0)+1});
+    var domTop=Object.keys(domCounts).sort(function(p,q){return domCounts[q]-domCounts[p]||p.localeCompare(q)}).slice(0,12);
+    if(activeDomain&&domTop.indexOf(activeDomain)<0)activeDomain="";
+    $("domainChips").innerHTML='<span class="fchip'+(activeDomain===""?" active":"")+'" data-d="">All<span class="ct">'+r.routes.length+'</span></span>'+
+      domTop.map(function(d){return '<span class="fchip'+(d===activeDomain?" active":"")+'" data-d="'+esc(d)+'">'+esc(d)+'<span class="ct">'+domCounts[d]+'</span></span>'}).join("");
+    applyDomainFilter();
+  }).catch(function(){$("health").textContent="fetch error";$("dotEl")&&($("dotEl").style.background="#fbbf24")});
+}
+load();loadRoutes();
+setInterval(load,30000);setInterval(loadRoutes,300000);
 
 /* ── COPY BUTTON ── */
 $("copyBtn").onclick=function(){
