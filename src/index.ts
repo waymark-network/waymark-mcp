@@ -693,7 +693,23 @@ function serverCard(env: Env) {
   };
 }
 
-const CORS = { "Access-Control-Allow-Origin": "*", "Access-Control-Expose-Headers": "ETag" };
+const CORS = { "Access-Control-Allow-Origin": "*", "Access-Control-Expose-Headers": "ETag, Link" };
+
+/* ---- RFC 8631 service-description discovery (item 45) ----
+ * Every JSON endpoint documented in /openapi.json advertises that document
+ * via a `Link: rel="service-desc"` response header, so a client that lands
+ * on ANY API response can discover the machine-readable service description
+ * without prior knowledge of the /openapi.json convention (the header-level
+ * twin of item 43's <link rel=alternate> on HTML pages). Applied at the
+ * dispatch site via withServiceDesc(); the response is re-wrapped because
+ * handler responses may carry immutable headers. Safe on 304s (null body). */
+const SERVICE_DESC_LINK = '<https://mcp.waymark.network/openapi.json>; rel="service-desc"';
+async function withServiceDesc(res: Response | Promise<Response>): Promise<Response> {
+  const r = await res;
+  const out = new Response(r.body, r);
+  out.headers.append("Link", SERVICE_DESC_LINK);
+  return out;
+}
 
 /* ---- ETag / conditional caching (item 5) ----
  * Weak ETag = first 8 bytes of SHA-256 of the response body. Pollers (the
@@ -1067,7 +1083,7 @@ export default {
       return Response.json(serverCard(env));
     }
     if (pathname === "/health") return new Response("ok");
-    if (pathname === "/stats") return stats(request, env);
+    if (pathname === "/stats") return withServiceDesc(stats(request, env));
     if (pathname === "/routes") {
       // Browsers get the server-rendered browse page; programmatic consumers
       // (dashboard fetch(), curl) keep getting JSON. No breaking change.
@@ -1083,9 +1099,9 @@ export default {
       const limit = Math.min(parseInt(searchParams.get("limit") ?? "100", 10) || 100, 500);
       return activityEndpoint(env, limit);
     }
-    if (pathname === "/freshness") return freshnessEndpoint(env);
+    if (pathname === "/freshness") return withServiceDesc(freshnessEndpoint(env));
     if (pathname === "/drift") return driftEndpoint(env, "html");
-    if (pathname === "/drift.json") return driftEndpoint(env, "json");
+    if (pathname === "/drift.json") return withServiceDesc(driftEndpoint(env, "json"));
     if (pathname === "/drift.xml" || pathname === "/drift.rss") return driftEndpoint(env, "rss");
     if (pathname === "/admin/drift" && request.method === "POST") {
       return recordDrift(env, request);
@@ -1097,7 +1113,7 @@ export default {
     }
     if (pathname === "/search") {
       const q = searchParams.get("q") ?? "";
-      return searchEndpoint(env, q, ctx);
+      return withServiceDesc(searchEndpoint(env, q, ctx));
     }
     if (pathname === "/admin/merge-index" && request.method === "POST") {
       return mergeIndex(env, request.headers.get("x-write-key"), request);
@@ -1114,7 +1130,7 @@ export default {
     if (pathname.startsWith("/r/")) {
       const rest = pathname.slice(3);
       // /r/{id}.json → machine-readable full route record (item 10).
-      if (rest.endsWith(".json")) return routeJson(request, env, rest.slice(0, -5));
+      if (rest.endsWith(".json")) return withServiceDesc(routeJson(request, env, rest.slice(0, -5)));
       return routePage(env, rest);
     }
     if (pathname === "/sitemap.xml") return sitemap(env);
@@ -1146,12 +1162,12 @@ export default {
       return new Response(JSON.stringify(openApiSpec(env)), { headers: { ...CORS, "Content-Type": "application/json", "Cache-Control": "public, max-age=3600" } });
     }
     // v0.6 — self-serve contributor keys + demand dashboard
-    if (pathname === "/v1/keys" && request.method === "POST") return issueKeyHttp(env, request);
+    if (pathname === "/v1/keys" && request.method === "POST") return withServiceDesc(issueKeyHttp(env, request));
     if (pathname === "/admin/revoke-key" && request.method === "POST") return revokeKey(env, request.headers.get("x-write-key"), request);
     if (pathname === "/demand") return demandPageEndpoint(env);
     if (pathname === "/demand.json") return demandJsonEndpoint(env);
     if (pathname === "/contributors") return contributorsEndpoint(env, false);
-    if (pathname === "/contributors.json") return contributorsEndpoint(env, true);
+    if (pathname === "/contributors.json") return withServiceDesc(contributorsEndpoint(env, true));
     // Root → marketing site. EVERY other unknown path → an honest 404, NOT a
     // soft-404 redirect-to-homepage. The old catch-all 302'd all unknown paths
     // to waymark.network (200), so crawlers indexed every junk URL as a homepage
