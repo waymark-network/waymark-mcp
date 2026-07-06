@@ -1349,7 +1349,12 @@ function driftPage(events: DriftEvent[]): string {
 <meta property="og:description" content="Waymark re-verifies thousands of API routes against live endpoints. When an API changes and breaks agents on stale knowledge, it shows up here first.">
 <meta property="og:type" content="website"><meta name="twitter:card" content="summary_large_image">
 <meta property="og:image" content="https://waymark.network/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:alt" content="waymark — the collective intelligence network for AI agents">
 <meta name="twitter:image" content="https://waymark.network/og.png">
+<meta name="twitter:image:alt" content="waymark — the collective intelligence network for AI agents">
 <link rel="canonical" href="https://mcp.waymark.network/drift">
 <link rel="alternate" type="application/rss+xml" title="Waymark API Drift Tracker" href="https://mcp.waymark.network/drift.xml">
 <link rel="alternate" type="application/json" title="Waymark API Drift Tracker (JSON)" href="https://mcp.waymark.network/drift.json">
@@ -1469,7 +1474,12 @@ function contributorsPage(data: ContributorStat[]): string {
 <meta property="og:description" content="Routes authored, domains covered, and attestation outcomes per contributor. Trust is earned by consensus — here's the leaderboard.">
 <meta property="og:type" content="website"><meta name="twitter:card" content="summary_large_image">
 <meta property="og:image" content="https://waymark.network/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:alt" content="waymark — the collective intelligence network for AI agents">
 <meta name="twitter:image" content="https://waymark.network/og.png">
+<meta name="twitter:image:alt" content="waymark — the collective intelligence network for AI agents">
 <link rel="canonical" href="https://mcp.waymark.network/contributors">
 <link rel="alternate" type="application/json" title="Waymark contributors (JSON)" href="https://mcp.waymark.network/contributors.json">
 <style>:root{--bg:#0b0e14;--panel:#131826;--line:#1f2840;--text:#e6ebf4;--dim:#8b96ad;--teal:#5eead4;--indigo:#818cf8;--gold:#fbbf24;--bad:#f87171;--good:#34d399}
@@ -1696,8 +1706,13 @@ async function routesBrowsePage(env: Env): Promise<Response> {
 <meta property="og:description" content="${escapeHtml(desc)}">
 <meta property="og:url" content="${pageUrl}">
 <meta property="og:image" content="https://waymark.network/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:alt" content="waymark — the collective intelligence network for AI agents">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:image" content="https://waymark.network/og.png">
+<meta name="twitter:image:alt" content="waymark — the collective intelligence network for AI agents">
 <meta name="twitter:title" content="Browse ${idx.length} agent routes — Waymark">
 <meta name="twitter:description" content="${escapeHtml(desc)}">
 <script type="application/ld+json">${jsonLdSafe(breadcrumbLd)}</script>
@@ -1797,8 +1812,13 @@ async function routeDomainPage(env: Env, slugRaw: string): Promise<Response> {
 <meta property="og:description" content="${escapeHtml(desc)}">
 <meta property="og:url" content="${pageUrl}">
 <meta property="og:image" content="https://waymark.network/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:alt" content="waymark — the collective intelligence network for AI agents">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:image" content="https://waymark.network/og.png">
+<meta name="twitter:image:alt" content="waymark — the collective intelligence network for AI agents">
 <meta name="twitter:title" content="${t} — agent routes | Waymark">
 <meta name="twitter:description" content="${escapeHtml(desc)}">
 <script type="application/ld+json">${jsonLdSafe(breadcrumbLd)}</script>
@@ -1956,6 +1976,8 @@ async function routePage(env: Env, id: string): Promise<Response> {
     "@context": "https://schema.org", "@type": "HowTo", name: r.task,
     step: r.steps.map((s, i) => ({ "@type": "HowToStep", position: i + 1, text: s })),
     about: r.domain, dateCreated: r.created,
+    // dateModified = last attestation (the route was last confirmed/observed then), else creation.
+    dateModified: r.attestations?.lastAt || r.created,
   };
   const breadcrumbLd = {
     "@context": "https://schema.org", "@type": "BreadcrumbList",
@@ -1978,8 +2000,13 @@ async function routePage(env: Env, id: string): Promise<Response> {
 <meta property="og:description" content="${desc}">
 <meta property="og:url" content="${pageUrl}">
 <meta property="og:image" content="https://waymark.network/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:alt" content="waymark — the collective intelligence network for AI agents">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:image" content="https://waymark.network/og.png">
+<meta name="twitter:image:alt" content="waymark — the collective intelligence network for AI agents">
 <meta name="twitter:title" content="${t} — ${titleKind} | Waymark">
 <meta name="twitter:description" content="${desc}">
 <script type="application/ld+json">${jsonLdSafe(jsonLd)}</script>
