@@ -280,8 +280,20 @@ async function upsertVector(env: Env, route: Route): Promise<void> {
   } catch { /* keyword fallback still serves it */ }
 }
 
+/* Input-size hardening (2026-07-06). Query text is unauthenticated public
+ * input that flows into a billed Workers AI embedding call per non-cached
+ * query. bge-base-en-v1.5 truncates at 512 tokens anyway, so capping at
+ * QUERY_MAX chars loses nothing semantically while bounding cost, KV event
+ * bloat, and keyword-path CPU. Applied inside retrieve() so every caller
+ * (waymark_query, /search, related-routes) is covered. We slice rather than
+ * reject: an agent pasting a long task description should still get results. */
+const QUERY_MAX = 2000;
+const DOMAIN_HINT_MAX = 200;
+
 /** Hybrid retrieve: vector-first with cutoff, keyword fallback. */
 async function retrieve(env: Env, query: string, domainHint: string | undefined, limit: number): Promise<Route[]> {
+  query = query.slice(0, QUERY_MAX);
+  if (domainHint) domainHint = domainHint.slice(0, DOMAIN_HINT_MAX);
   try {
     const qv = await embedQuery(env, query + (domainHint ? " — " + domainHint : ""));
     const res = await env.VEC.query(qv, { topK: Math.max(limit * 3, 12), returnMetadata: "none" });
@@ -507,13 +519,22 @@ export class WaymarkMCP extends McpAgent<Env> {
           "After completing a task, contribute the sanitized procedure (steps that worked, " +
           "gotchas hit) so other agents can reuse it. Submit procedure only — never credentials, " +
           "personal data, or payload contents. Requires a contributor API key (waymark.network).",
+        // Field-size caps (2026-07-06): contributions land in route:{id} AND the
+        // shared fat index (idx:routes, type IdxEntry = Route) that every read
+        // surface parses — unbounded fields let one free self-serve key (20/h)
+        // balloon the index toward KV's 25 MB value limit, degrading every
+        // getIndex() consumer and eventually breaking patchIndex corpus-wide.
+        // Caps calibrated against the live 6,440-route corpus (2026-07-06 maxima:
+        // task 247, domain 135, steps 6×350, gotchas 3×402, ~2.9 KB/route) with
+        // 2–10× headroom — no existing or plausibly legitimate route is rejected.
+        // Worst-case accepted route is now ~50 KB vs unbounded.
         inputSchema: {
-          api_key: z.string().describe("Contributor API key from waymark.network"),
-          task: z.string().describe("What the route accomplishes, stated generally"),
-          domain: z.string().describe("Service/site/API the route applies to"),
-          steps: z.array(z.string()).min(1).describe("Ordered procedural steps (sanitized)"),
-          gotchas: z.array(z.string()).default([]).describe("Failure modes, rate limits, quirks encountered"),
-          contributor: z.string().describe("Your agent/org handle"),
+          api_key: z.string().max(200).describe("Contributor API key from waymark.network"),
+          task: z.string().max(500).describe("What the route accomplishes, stated generally"),
+          domain: z.string().max(200).describe("Service/site/API the route applies to"),
+          steps: z.array(z.string().max(1200)).min(1).max(25).describe("Ordered procedural steps (sanitized)"),
+          gotchas: z.array(z.string().max(1200)).max(15).default([]).describe("Failure modes, rate limits, quirks encountered"),
+          contributor: z.string().max(120).describe("Your agent/org handle"),
         },
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
       },
@@ -585,9 +606,9 @@ export class WaymarkMCP extends McpAgent<Env> {
           "Report whether following a Waymark route led to task success or failure. " +
           "Attestations drive route trust by consensus — always attest after using a route.",
         inputSchema: {
-          route_id: z.string(),
+          route_id: z.string().max(64), // uuids are 36 chars
           outcome: z.enum(["success", "failure"]),
-          note: z.string().optional().describe("Optional short note on what diverged"),
+          note: z.string().max(500).optional().describe("Optional short note on what diverged"), // only ever rendered sliced to 140
         },
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
       },
@@ -1611,7 +1632,11 @@ async function searchEndpoint(env: Env, q: string, ctx: ExecutionContext): Promi
   // query event) are unaffected — only the expensive retrieve() is deduped. TTL
   // 60s == the response's existing downstream max-age, so no extra staleness.
   const cache = (caches as unknown as { default: Cache }).default;
-  const norm = q.trim().toLowerCase().slice(0, 256);
+  // Cache key MUST be derived from the same QUERY_MAX slice retrieve() actually
+  // embeds — a shorter key (this was 256) let two long queries sharing a prefix
+  // serve each other's cached results. Identical slice → identical retrieval
+  // input → collision-free by construction.
+  const norm = q.trim().toLowerCase().slice(0, QUERY_MAX);
   const cacheKey = new Request(`https://mcp.waymark.network/__searchcache?q=${encodeURIComponent(norm)}`);
   let ranked: unknown[] | null = null;
   let retrievalMs = -1; // -1 signals a retrieval-cache hit (no Vectorize query ran)
