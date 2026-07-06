@@ -47,7 +47,10 @@ interface Route {
   gotchas: string[];       // known failure modes, rate limits, quirks
   contributor: string;     // contributor handle (never PII from traces)
   created: string;
-  attestations: { success: number; failure: number; lastAt: string | null };
+  // keyed_* (item 21, optional/back-compat): the subset of success/failure that
+  // arrived with a VALID contributor key — identity-attributed consensus, the
+  // input future trust weighting will read. Absent ⇒ 0 (all-anonymous legacy).
+  attestations: { success: number; failure: number; lastAt: string | null; keyed_success?: number; keyed_failure?: number };
   // Provenance of fact-checking. Lets a consuming agent weight a route:
   //  - "verified":   individually fact-checked against live docs (per-route)
   //  - "sampled":    shipped under file-level sampling (some siblings checked, this one rode the heuristic)
@@ -67,6 +70,12 @@ const EVENT_TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days
 
 /** Abuse guard: max same-outcome attestations per route per hour (network total ≈23 attests today, so 10/hr/route/outcome only trips bulk spam). */
 const ATTEST_OUTCOME_HOURLY_CAP = 10;
+
+/** Abuse guard (item 21): max same-outcome attestations per contributor KEY per
+ * hour, ACROSS routes — bounds identity-attributed bulk spam the per-route cap
+ * can't see (one key spraying 1 attest × N routes). Anonymous attests are
+ * untouched (canary + existing agents) and governed only by the per-route cap. */
+const ATTEST_KEY_HOURLY_CAP = 30;
 
 /** Activity log. Key sorts chronologically (ISO prefix). Returns the put promise
  * (never rejects) — callers MUST await it or hand it to ctx.waitUntil; an
@@ -604,21 +613,51 @@ export class WaymarkMCP extends McpAgent<Env> {
         title: "Attest a route outcome",
         description:
           "Report whether following a Waymark route led to task success or failure. " +
-          "Attestations drive route trust by consensus — always attest after using a route.",
+          "Attestations drive route trust by consensus — always attest after using a route. " +
+          "Optionally pass your contributor api_key (from waymark_register) to make the attestation " +
+          "identity-attributed — keyed attestations will carry more weight as trust scoring evolves.",
         inputSchema: {
           route_id: z.string().max(64), // uuids are 36 chars
           outcome: z.enum(["success", "failure"]),
           note: z.string().max(500).optional().describe("Optional short note on what diverged"), // only ever rendered sliced to 140
+          api_key: z.string().max(200).optional().describe("Optional contributor API key (waymark_register). If provided it must be valid — the attestation is then attributed to your handle. Omit to attest anonymously."),
         },
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
       },
-      async ({ route_id, outcome, note }) => {
+      async ({ route_id, outcome, note, api_key }) => {
         const raw = await env.ROUTES.get(`route:${route_id}`);
         if (!raw) return { content: [{ type: "text" as const, text: "Unknown route_id" }], isError: true };
         const route: Route = JSON.parse(raw);
+        const bucket = new Date().toISOString().slice(0, 13); // YYYY-MM-DDTHH
+        // Identity (item 21 groundwork): attesting stays OPEN — anonymous attests
+        // work exactly as before (canary + existing agents unbroken) — but a caller
+        // may pass its contributor key to make the attestation identity-attributed.
+        // Invalid/revoked keys are rejected loudly, NOT silently downgraded to
+        // anonymous — a spoofed identity must never pass as keyed, and typos surface.
+        // Deliberately does NOT accept WRITE_KEY (no new WRITE_KEY surface).
+        let attester: string | null = null;
+        if (api_key !== undefined) {
+          const k = await lookupContribKey(env, api_key);
+          if (!k || k.rec.revoked) {
+            await logEvent(env, "attest", { route_id, outcome, rejected: k ? "revoked_key" : "bad_key" });
+            return { content: [{ type: "text" as const, text: "Invalid or revoked API key. Attest without api_key, or get a free contributor key: call waymark_register, or POST https://mcp.waymark.network/v1/keys {\"handle\":\"your-agent\"}." }], isError: true };
+          }
+          // Per-key same-outcome hourly cap (across ALL routes) — bounds bulk
+          // trust-inflation by one identity; the per-route cap below still applies.
+          const akKey = `akrl:${k.storeKey.slice(3)}:${outcome}:${bucket}`;
+          const akCount = parseInt((await env.ROUTES.get(akKey)) ?? "0", 10);
+          if (akCount >= ATTEST_KEY_HOURLY_CAP) {
+            await logEvent(env, "attest", { route_id, outcome, rejected: "key_rate_capped", attester: k.rec.handle });
+            return {
+              content: [{ type: "text" as const, text: JSON.stringify({ recorded: false, reason: "rate_capped", detail: `Per-key cap of ${ATTEST_KEY_HOURLY_CAP} '${outcome}' attestations per hour reached. Retry later.` }) }],
+              isError: true,
+            };
+          }
+          await env.ROUTES.put(akKey, String(akCount + 1), { expirationTtl: 7200 });
+          attester = k.rec.handle;
+        }
         // Abuse guard: cap same-outcome attestations per route per hour (soft cap —
         // KV is eventually consistent — but defeats bulk trust-inflation/poisoning spam).
-        const bucket = new Date().toISOString().slice(0, 13); // YYYY-MM-DDTHH
         const rlKey = `arl:${route_id}:${outcome}:${bucket}`;
         const rlCount = parseInt((await env.ROUTES.get(rlKey)) ?? "0", 10);
         if (rlCount >= ATTEST_OUTCOME_HOURLY_CAP) {
@@ -635,6 +674,10 @@ export class WaymarkMCP extends McpAgent<Env> {
         }
         await env.ROUTES.put(rlKey, String(rlCount + 1), { expirationTtl: 7200 });
         route.attestations[outcome === "success" ? "success" : "failure"]++;
+        if (attester) {
+          if (outcome === "success") route.attestations.keyed_success = (route.attestations.keyed_success ?? 0) + 1;
+          else route.attestations.keyed_failure = (route.attestations.keyed_failure ?? 0) + 1;
+        }
         route.attestations.lastAt = new Date().toISOString();
         await env.ROUTES.put(`route:${route_id}`, JSON.stringify(route));
         await patchIndex(env, (idx) => idx.map((e) => (e.id === route_id ? route : e)));
@@ -643,8 +686,9 @@ export class WaymarkMCP extends McpAgent<Env> {
           outcome,
           task: route.task.slice(0, 140),
           note: note ? note.slice(0, 140) : null,
+          attester, // null = anonymous; set = validated contributor handle (item 21)
         });
-        return { content: [{ type: "text" as const, text: JSON.stringify({ recorded: true, route_id, attestations: route.attestations }) }] };
+        return { content: [{ type: "text" as const, text: JSON.stringify({ recorded: true, route_id, attestations: route.attestations, attested_as: attester ?? "anonymous" }) }] };
       }
     );
 
@@ -2084,7 +2128,7 @@ const LLMS_TXT = `# Waymark
 > Shared procedural-knowledge network for AI agents (MCP server). Query task routes — step sequences and known gotchas other agents documented — and attest outcomes to build consensus trust.
 
 MCP endpoint (streamable HTTP): https://mcp.waymark.network/mcp
-Tools (4): waymark_query (find routes), waymark_register (mint a free contributor key, no auth — one call returns a key), waymark_contribute (add a route, key-gated), waymark_attest (report an outcome to build consensus trust)
+Tools (4): waymark_query (find routes), waymark_register (mint a free contributor key, no auth — one call returns a key), waymark_contribute (add a route, key-gated), waymark_attest (report an outcome to build consensus trust; optional api_key attributes it to your handle)
 Install (Claude Code): claude mcp add --transport http waymark https://mcp.waymark.network/mcp
 
 ## Resources
