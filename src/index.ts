@@ -1484,6 +1484,11 @@ async function contributorsData(env: Env): Promise<ContributorStat[]> {
   const idx = await getIndex(env);
   const map = new Map<string, { routes: number; domains: Map<string, number>; success: number; failure: number; verified: number; last: string | null }>();
   for (const r of idx) {
+    // Item 57: routes on synthetic e2e/test domains don't count toward the public
+    // leaderboard; a handle whose ONLY routes are synthetic (e.g. e2e-loop-test)
+    // drops off entirely. Presenting loop-test handles as "contributors" made the
+    // leaderboard dishonest in both directions — inflated count, junk entries.
+    if (isSyntheticTraffic(r.domain)) continue;
     const h = (r.contributor || "unknown").trim() || "unknown";
     let c = map.get(h);
     if (!c) { c = { routes: 0, domains: new Map(), success: 0, failure: 0, verified: 0, last: null }; map.set(h, c); }
@@ -1746,7 +1751,13 @@ async function searchEndpoint(env: Env, q: string, ctx: ExecutionContext): Promi
  *  with the domain count (~1 entry each) instead of the full route list — flat
  *  as the index grows past 10k routes (item 6c). */
 async function routesBrowsePage(env: Env): Promise<Response> {
-  const idx = await getIndex(env);
+  // Item 57: synthetic e2e/test routes (e.g. "example-e2e.invalid" — "E2E TEST
+  // delete me…") are legitimate corpus entries for loop-testing but must never
+  // appear on indexable/browse surfaces. Same predicate the demand surfaces use
+  // (isSyntheticTraffic), applied to the corpus side. Data APIs (/routes JSON,
+  // /search, /r/{id}.json) stay unfiltered — programmatic consumers and the e2e
+  // loop itself may rely on them.
+  const idx = (await getIndex(env)).filter((r) => !isSyntheticTraffic(r.domain));
   const counts = new Map<string, number>();
   for (const r of idx) counts.set(r.domain, (counts.get(r.domain) ?? 0) + 1);
   // Domains by route count desc (richest first), then alphabetical.
@@ -1824,7 +1835,9 @@ q.addEventListener("input",function(){
  *  handled, so no domain becomes unreachable). */
 async function routeDomainPage(env: Env, slugRaw: string): Promise<Response> {
   const slug = slugRaw.replace(/\/+$/, "");
-  const idx = await getIndex(env);
+  // Item 57: synthetic e2e/test domains are excluded ⇒ their slug falls through
+  // to the existing noindex 404 below (honest 404, item-17 convention).
+  const idx = (await getIndex(env)).filter((r) => !isSyntheticTraffic(r.domain));
   const matched = new Map<string, Route[]>();
   for (const r of idx) {
     if (domainSlug(r.domain) !== slug) continue;
@@ -2068,7 +2081,7 @@ async function routePage(env: Env, id: string): Promise<Response> {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${t} — ${titleKind} | Waymark</title>
 <meta name="description" content="${desc}">
-<link rel="canonical" href="${pageUrl}">
+${isSyntheticTraffic(r.domain) ? `<meta name="robots" content="noindex">\n` : ""}<link rel="canonical" href="${pageUrl}">
 <link rel="alternate" type="application/json" title="This route as JSON" href="${pageUrl}.json">
 <meta property="og:type" content="article">
 <meta property="og:site_name" content="Waymark">
@@ -2126,7 +2139,11 @@ One MCP install gives any agent live access to the full route map${scaleDomains}
 
 /** Sitemap of all route pages. */
 async function sitemap(env: Env): Promise<Response> {
-  const idx = await getIndex(env);
+  // Item 57: filter at the source — BOTH the domain-page loop and the /r/{id}
+  // idx.map() below must exclude synthetic e2e/test routes, so never invite
+  // crawlers to them. (First attempt filtered only the loop and left the 3
+  // /r/{id} test URLs in — caught in live verification.)
+  const idx = (await getIndex(env)).filter((r) => !isSyntheticTraffic(r.domain));
   // <lastmod> (W3C datetime) gives crawlers a per-URL recrawl signal across the
   // 8600+ URLs here, so they can prioritise routes that actually changed instead
   // of treating every page as equally stale. A route changes when it's (re)created
