@@ -1389,7 +1389,7 @@ function driftFeed(events: DriftEvent[]): string {
 <title>Waymark API Drift Tracker</title>
 <link>${PAGE}</link>
 <atom:link href="${SELF}" rel="self" type="application/rss+xml"/>
-<description>Real API changes that silently break AI agents running on stale knowledge — detected by Waymark's canary fleet re-verifying routes against live APIs.</description>
+<description>Real API changes that silently break AI agents running on stale knowledge — logged when Waymark's canary re-verification catches a change in a live API. Every entry is from a real verification run, timestamped at detection.</description>
 <language>en-us</language>
 <lastBuildDate>${built}</lastBuildDate>
 <ttl>60</ttl>
@@ -1412,9 +1412,9 @@ function driftPage(events: DriftEvent[]): string {
   }).join("");
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>API Drift Tracker — when the API world shifts under AI agents | Waymark</title>
-<meta name="description" content="Live tracker of real API changes that silently break AI agents running on stale knowledge — detected by Waymark's canary fleet re-verifying routes against live APIs.">
+<meta name="description" content="Changelog of real API changes that silently break AI agents running on stale knowledge — logged when Waymark's canary re-verification catches a change in a live API.">
 <meta property="og:title" content="API Drift Tracker — APIs that just broke your AI agents">
-<meta property="og:description" content="Waymark re-verifies thousands of API routes against live endpoints. When an API changes and breaks agents on stale knowledge, it shows up here first.">
+<meta property="og:description" content="When Waymark's canary verification catches an API change that breaks agents on stale knowledge, it shows up here — timestamped, with the fix.">
 <meta property="og:type" content="website"><meta name="twitter:card" content="summary_large_image">
 <meta property="og:image" content="https://waymark.network/og.png">
 <meta property="og:image:width" content="1200">
@@ -1449,11 +1449,11 @@ h1 em{font-style:normal;background:linear-gradient(110deg,var(--teal),var(--indi
 footer{color:#5b6880;font-size:12.5px;margin-top:40px}</style></head><body>
 <nav><div class="logo">waymark</div><div><a class="lk" href="/dashboard">Live dashboard</a><a class="lk" href="/contributors">Contributors</a><a class="lk" href="https://waymark.network/benchmark">Benchmark</a><a class="lk" href="https://waymark.network">waymark.network</a></div></nav>
 <h1>The API world shifts under your agents. <em>Here's the changelog.</em></h1>
-<p class="lede">APIs change constantly — endpoints deprecate, auth models shift, required fields appear. AI agents running on training-cutoff knowledge break silently. Waymark re-verifies thousands of API routes against live endpoints every day; when something drifts, it surfaces here first.</p>
-<div class="how"><b>How this works:</b> Waymark's canary fleet re-executes documented API routes against the real, live APIs. When a previously-working route is rejected by the live service — a deprecated endpoint, a changed parameter, a new requirement — that's <b>drift</b>, and your agents are about to fail on it. We log it, fix the route, and publish it here.</div>
-${events.length ? rows : `<div class="empty">No drift detected in the current window — every re-verified route still matches its live API. The canary runs daily; changes will appear here as they're caught.</div>`}
+<p class="lede">APIs change constantly — endpoints deprecate, auth models shift, required fields appear. AI agents running on training-cutoff knowledge break silently. When Waymark's canary re-verification catches a route drifting from its live API, it's logged here — timestamped, with the fix.</p>
+<div class="how"><b>How this works:</b> Waymark's canary re-executes documented API routes against the real, live APIs in verification campaigns. When a previously-working route is rejected by the live service — a deprecated endpoint, a changed parameter, a new requirement — that's <b>drift</b>, and your agents are about to fail on it. We log it, fix the route, and publish it here. Every entry below is from a real canary run, timestamped at detection — nothing is backdated or synthesized.${events.length ? ` Currently <b>${events.length}</b> logged drift event${events.length === 1 ? "" : "s"}; newest logged <b>${esc2(events[0].t.slice(0, 10))}</b>.` : ""}</div>
+${events.length ? rows : `<div class="empty">No drift entries logged yet in this window. Entries appear when a canary verification campaign catches a live API change.</div>`}
 <div class="cta"><h2>Stop your agents from running on stale API knowledge</h2>
-<p style="color:var(--dim);font-size:14px">Waymark gives any agent live, continuously re-checked routes — the current way to call every API, with the gotchas that just changed. One MCP install:</p>
+<p style="color:var(--dim);font-size:14px">Waymark gives any agent community-verified routes — the current way to call an API, with the gotchas that changed and every attestation recorded in the open. One MCP install:</p>
 <code>claude mcp add --transport http waymark https://mcp.waymark.network/mcp</code></div>
 <footer>Waymark — the shared, self-verifying route map for AI agents · a service of MC Software, LLC · <a href="/drift.json">JSON feed</a> · <a href="/drift.xml">RSS</a></footer>
 </body></html>`;
@@ -2252,7 +2252,7 @@ function openApiSpec(env: Env) {
         get: {
           operationId: "getFreshness",
           summary: "Route freshness + re-verify priority",
-          description: "Time-decayed trust per route (60-day half-life), bucket counts, and the stalest-first re-verify queue the canary fleet drains.",
+          description: "Time-decayed trust per route (60-day half-life), bucket counts, and the stalest-first queue canary re-verification runs work from.",
           responses: { "200": { description: "Freshness report.", content: { "application/json": { schema: { $ref: "#/components/schemas/Freshness" } } } } },
         },
       },
