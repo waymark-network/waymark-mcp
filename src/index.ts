@@ -1951,6 +1951,10 @@ async function routeJson(request: Request, env: Env, id: string): Promise<Respon
     attestations: {
       success: r.attestations.success,
       failure: r.attestations.failure,
+      // Keyed = attributed to a validated contributor key (item 49); a subset of
+      // success/failure, never a separate tally. Absent on pre-item-49 records ⇒ 0.
+      keyed_success: r.attestations.keyed_success ?? 0,
+      keyed_failure: r.attestations.keyed_failure ?? 0,
       last_attested: r.attestations.lastAt,
     },
     success_rate: total > 0 ? r.attestations.success / total : null,
@@ -1970,6 +1974,10 @@ async function routePage(env: Env, id: string): Promise<Response> {
   const t = escapeHtml(r.task), d = escapeHtml(r.domain);
   const total = r.attestations.success + r.attestations.failure;
   const attestPct = total > 0 ? Math.round((r.attestations.success / total) * 100) : null;
+  // Keyed vs anonymous split (item 50): keyed = attributed to a validated contributor
+  // key (item 49), a SUBSET of the totals above — so anonymous = total − keyed.
+  const keyed = (r.attestations.keyed_success ?? 0) + (r.attestations.keyed_failure ?? 0);
+  const anon = Math.max(0, total - keyed);
 
   // Two independent trust axes — surface BOTH honestly, never conflate them:
   //  1. provenance: how the route was vetted before serving (verified/sampled/unverified)
@@ -2076,7 +2084,7 @@ footer{color:var(--dim);font-size:13px;margin-top:28px}
 <nav class="crumbs" aria-label="Breadcrumb"><a href="https://waymark.network">Waymark</a><span class="sep">/</span><a href="https://mcp.waymark.network/routes">Routes</a><span class="sep">/</span><a href="https://mcp.waymark.network/routes/${domainSlug(r.domain)}">${d}</a></nav>
 <h1>${t}</h1>
 <div class="meta">domain: <b>${d}</b> · ${r.steps.length} steps · contributed by ${escapeHtml(r.contributor)}</div>
-<div class="vbadge v-${vStatus}"><span class="vp">${vProvenance}</span><span class="va">community attestations: ${r.attestations.success}✓ / ${r.attestations.failure}✗${attestPct !== null ? ` · ${attestPct}% success` : ""}</span></div>
+<div class="vbadge v-${vStatus}"><span class="vp">${vProvenance}</span><span class="va">community attestations: ${r.attestations.success}✓ / ${r.attestations.failure}✗${attestPct !== null ? ` · ${attestPct}% success` : ""}${total > 0 ? ` · ${keyed} keyed / ${anon} anonymous` : ""}</span></div>
 <div class="panel"><h2>${stepsHeading}</h2><ol>${r.steps.map((s) => `<li>${escapeHtml(s)}</li>`).join("")}</ol></div>
 ${r.gotchas.length ? `<div class="panel g"><h2>Known gotchas</h2><ul>${r.gotchas.map((g) => `<li>${escapeHtml(g)}</li>`).join("")}</ul></div>` : ""}
 ${related.length ? `<div class="panel rel"><h2>Related routes</h2>${related.map((x) => {
@@ -2273,7 +2281,7 @@ function openApiSpec(env: Env) {
             id: { type: "string", format: "uuid" }, task: { type: "string" }, domain: { type: "string" },
             steps: { type: "array", items: { type: "string" } }, gotchas: { type: "array", items: { type: "string" } },
             contributor: { type: "string" }, created: { type: "string", format: "date-time" },
-            attestations: { type: "object", properties: { success: { type: "integer" }, failure: { type: "integer" }, last_attested: { type: ["string", "null"], format: "date-time" } } },
+            attestations: { type: "object", properties: { success: { type: "integer" }, failure: { type: "integer" }, keyed_success: { type: "integer", description: "Attestations attributed to a validated contributor key. A subset of success, not a separate tally." }, keyed_failure: { type: "integer", description: "Keyed subset of failure." }, last_attested: { type: ["string", "null"], format: "date-time" } } },
             success_rate: { type: ["number", "null"], description: "success / (success+failure), or null if never attested." },
             verification: { $ref: "#/components/schemas/Verification" }, url: { type: "string", format: "uri" },
           },
