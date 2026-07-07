@@ -698,7 +698,7 @@ export class WaymarkMCP extends McpAgent<Env> {
         title: "Register for a contributor key",
         description:
           "Get a free contributor API key so you can submit routes with waymark_contribute. " +
-          "The key is returned once — store it. Use one handle per agent/org.",
+          "The key is returned once — store it. Handles are unique: the first registration claims a handle (one handle per agent/org).",
         inputSchema: {
           handle: z.string().min(2).max(60).describe("Your agent/org handle, e.g. 'acme-sales-agent'"),
         },
@@ -714,7 +714,10 @@ export class WaymarkMCP extends McpAgent<Env> {
         }
         const res = await createContribKey(env, h);
         if (!res.ok) {
-          return { content: [{ type: "text" as const, text: JSON.stringify({ status: res.reason, detail: "Key issuance temporarily rate-limited network-wide. Retry shortly." }) }], isError: true };
+          const detail = res.reason === "handle_taken"
+            ? "That handle is already registered — handles are unique (first come). Choose a different handle; keys are shown once and cannot be recovered self-serve."
+            : "Key issuance temporarily rate-limited network-wide. Retry shortly.";
+          return { content: [{ type: "text" as const, text: JSON.stringify({ status: res.reason, detail }) }], isError: true };
         }
         await logEvent(env, "register", { handle: h });
         return { content: [{ type: "text" as const, text: JSON.stringify({ api_key: res.key, handle: h, note: "Store this key now — it is shown only once. Pass it as api_key in waymark_contribute." }) }] };
@@ -836,9 +839,23 @@ async function lookupContribKey(env: Env, rawKey: string): Promise<{ rec: Contri
   return { rec: JSON.parse(raw) as ContribKey, storeKey };
 }
 
+/** Handle uniqueness (anti-impersonation): attribution for contributions and
+ * keyed attestations is handle-based, so a second key minted for an existing
+ * handle would silently merge into that contributor's leaderboard stats and
+ * provenance. First registration claims the normalized handle via a
+ * `hnd:{normalized}` marker; later attempts are rejected (handle_taken).
+ * Prospective only — keys that existed before this shipped stay valid.
+ * NOTE: KV is non-atomic, so a concurrent same-handle race is soft (same
+ * accepted class as the rate-limit counters, review #3). */
+function normalizeHandle(h: string): string {
+  return h.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
 /** Mint a key (shared by the MCP tool and the HTTP endpoint). Global cap only;
  * the HTTP endpoint adds a per-IP cap on top. */
 async function createContribKey(env: Env, handle: string): Promise<{ ok: true; key: string } | { ok: false; reason: string }> {
+  const hndKey = `hnd:${normalizeHandle(handle)}`;
+  if (await env.ROUTES.get(hndKey)) return { ok: false, reason: "handle_taken" }; // checked before the cap so probes don't burn issuance budget
   const bucket = new Date().toISOString().slice(0, 13);
   const gKey = `krl:global:${bucket}`;
   const used = parseInt((await env.ROUTES.get(gKey)) ?? "0", 10);
@@ -846,7 +863,9 @@ async function createContribKey(env: Env, handle: string): Promise<{ ok: true; k
   await env.ROUTES.put(gKey, String(used + 1), { expirationTtl: 7200 });
   const rawKey = "wmk_" + [...crypto.getRandomValues(new Uint8Array(24))].map((b) => b.toString(16).padStart(2, "0")).join("");
   const rec: ContribKey = { handle, created: new Date().toISOString(), revoked: false, contributions: 0, lastAt: null };
-  await env.ROUTES.put(`ck:${await sha256hex(rawKey)}`, JSON.stringify(rec));
+  const keyHash = await sha256hex(rawKey);
+  await env.ROUTES.put(`ck:${keyHash}`, JSON.stringify(rec));
+  await env.ROUTES.put(hndKey, JSON.stringify({ handle, created: rec.created, key_hash: keyHash }));
   await env.ROUTES.get("counter:keys").then((v) => env.ROUTES.put("counter:keys", String(parseInt(v ?? "0", 10) + 1))).catch(() => {});
   return { ok: true, key: rawKey };
 }
@@ -870,7 +889,12 @@ async function issueKeyHttp(env: Env, request: Request): Promise<Response> {
   }
   await env.ROUTES.put(ipKey, String(ipUsed + 1), { expirationTtl: 7200 });
   const res = await createContribKey(env, handle);
-  if (!res.ok) return Response.json({ error: "network-wide key issuance rate limit reached; retry shortly" }, { status: 429, headers: CORS });
+  if (!res.ok) {
+    if (res.reason === "handle_taken") {
+      return Response.json({ error: "handle already registered — handles are unique (first come). Choose a different handle; keys are shown once and cannot be recovered self-serve." }, { status: 409, headers: CORS });
+    }
+    return Response.json({ error: "network-wide key issuance rate limit reached; retry shortly" }, { status: 429, headers: CORS });
+  }
   await logEvent(env, "register", { handle });
   return Response.json({ api_key: res.key, handle, note: "Store this key now — it is shown only once. Use it as api_key in waymark_contribute." }, { headers: CORS });
 }
@@ -2251,11 +2275,12 @@ function openApiSpec(env: Env) {
         post: {
           operationId: "issueContributorKey",
           summary: "Mint a free contributor key (no auth)",
-          description: "One call returns a contributor API key used as `api_key` in waymark_contribute. Per-IP and network-wide hourly rate limits apply.",
+          description: "One call returns a contributor API key used as `api_key` in waymark_contribute. Handles are unique — the first registration claims a handle. Per-IP and network-wide hourly rate limits apply.",
           requestBody: { required: true, content: { "application/json": { schema: { type: "object", required: ["handle"], properties: { handle: { type: "string", minLength: 2, maxLength: 60, description: "Contributor handle: letters, digits, space, _ . - / @." } } } } } },
           responses: {
             "200": { description: "Key issued (shown once).", content: { "application/json": { schema: { type: "object", required: ["api_key", "handle"], properties: { api_key: { type: "string", description: "Contributor key (prefix wmk_). Store it now — not retrievable later." }, handle: { type: "string" }, note: { type: "string" } } } } } },
             "400": { description: "Invalid or reserved handle.", content: { "application/json": { schema: { $ref: "#/components/schemas/ApiError" } } } },
+            "409": { description: "Handle already registered (handles are unique, first come).", content: { "application/json": { schema: { $ref: "#/components/schemas/ApiError" } } } },
             "429": { description: "Rate limited (per-IP or network-wide).", content: { "application/json": { schema: { $ref: "#/components/schemas/ApiError" } } } },
           },
         },
