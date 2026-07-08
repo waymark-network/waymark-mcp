@@ -1046,6 +1046,81 @@ async function routeRequestFulfill(env: Env, adminKey: string | null, request: R
   return Response.json({ ok: true, request: rec });
 }
 
+/* ---------------- M7 — drift-alert email capture ----------------
+ * "Email me when an API I depend on changes" — the funnel on the drift tracker,
+ * our best free-tool magnet. INTAKE ONLY: no mail infrastructure exists yet, so
+ * nothing is ever sent; the form copy says so explicitly. Records are stored
+ * double-opt-in-ready (confirmed:false until a future confirmation flow flips
+ * it) and the subscriber COUNT feeds /demand as a demand signal. Emails are PII:
+ * they appear only in the WRITE_KEY-gated /admin/drift-alerts list, never on a
+ * public surface. */
+const DA_IP_DAILY_CAP = 10;
+const DA_MAX_DOMAINS = 20;
+
+interface DriftAlert {
+  email: string; domains: string[]; created: string; updated: string;
+  confirmed: boolean; // double-opt-in-ready: stays false until a real confirmation flow exists
+  source: string;
+}
+
+/** POST /v1/drift-alerts {email, domains?: string[] | comma-string} — public, IP-rate-limited. */
+async function driftAlertCreate(env: Env, request: Request): Promise<Response> {
+  let b: { email?: unknown; domains?: unknown } = {};
+  try { b = ((await request.json()) as typeof b) ?? {}; } catch { /* validated below */ }
+  const email = String(b.email ?? "").trim().toLowerCase();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) || email.length > 120) {
+    return Response.json({ error: "email required: a valid address (max 120 chars)" }, { status: 400, headers: CORS });
+  }
+  // domains: accept an array or a comma-separated string; normalize, dedupe, cap.
+  const rawDomains = Array.isArray(b.domains) ? b.domains.map(String) : String(b.domains ?? "").split(",");
+  const domains = [...new Set(rawDomains.map((d) => d.trim().toLowerCase()).filter((d) => d.length > 0 && d.length <= 80))].slice(0, DA_MAX_DOMAINS);
+  const ip = request.headers.get("cf-connecting-ip") ?? "0.0.0.0";
+  const bucket = new Date().toISOString().slice(0, 10);
+  const rlKey = `darl:${ip}:${bucket}`;
+  const used = parseInt((await env.ROUTES.get(rlKey)) ?? "0", 10);
+  if (used >= DA_IP_DAILY_CAP) {
+    return Response.json({ error: `rate limited: max ${DA_IP_DAILY_CAP} signups/day from one IP` }, { status: 429, headers: CORS });
+  }
+  await env.ROUTES.put(rlKey, String(used + 1), { expirationTtl: 172800 });
+  const storeKey = `da:${email}`;
+  const now = new Date().toISOString();
+  const existingRaw = await env.ROUTES.get(storeKey);
+  let rec: DriftAlert;
+  if (existingRaw) {
+    // Repeat signup = update: merge domain watchlists, keep original created/confirmed.
+    try { rec = JSON.parse(existingRaw) as DriftAlert; } catch { rec = { email, domains: [], created: now, updated: now, confirmed: false, source: "drift-page" }; }
+    rec.domains = [...new Set([...rec.domains, ...domains])].slice(0, DA_MAX_DOMAINS);
+    rec.updated = now;
+  } else {
+    rec = { email, domains, created: now, updated: now, confirmed: false, source: "drift-page" };
+    await env.ROUTES.get("counter:drift_alerts").then((v) => env.ROUTES.put("counter:drift_alerts", String(parseInt(v ?? "0", 10) + 1))).catch(() => {});
+  }
+  await env.ROUTES.put(storeKey, JSON.stringify(rec));
+  return Response.json({
+    ok: true, watching: rec.domains.length ? rec.domains : "all drifted APIs",
+    note: "Signup recorded. Alert delivery hasn't launched yet — when it does, you're on the list from day one. Until then the drift changelog is live at /drift and /drift.xml (RSS).",
+  }, { headers: CORS });
+}
+
+/** Subscriber count only — fed to public /demand surfaces. Key-name list, zero
+ *  value reads, no PII exposure. Fail-closed to 0 so /demand always renders. */
+async function driftAlertCount(env: Env): Promise<number> {
+  try { return (await env.ROUTES.list({ prefix: "da:", limit: 1000 })).keys.length; } catch { return 0; }
+}
+
+/** GET /admin/drift-alerts — WRITE_KEY-gated: the operator's send list (PII stays here). */
+async function driftAlertsList(env: Env, adminKey: string | null): Promise<Response> {
+  if (adminKey !== env.WRITE_KEY) return new Response("forbidden", { status: 403 });
+  const listed = await env.ROUTES.list({ prefix: "da:", limit: 1000 });
+  const out: DriftAlert[] = [];
+  for (const k of listed.keys.slice(0, 500)) {
+    const raw = await env.ROUTES.get(k.name);
+    if (raw) { try { out.push(JSON.parse(raw) as DriftAlert); } catch { /* skip corrupt */ } }
+  }
+  out.sort((a, b) => (a.created < b.created ? 1 : -1));
+  return Response.json({ total: listed.keys.length, subscribers: out });
+}
+
 /* ---------------- Demand dashboard (v0.6) ----------------
  * Route COUNT is a supply/vanity metric. /demand tracks the numbers that show a
  * network actually forming: real (non-playground) agent queries, coverage gaps
@@ -1074,6 +1149,7 @@ interface DemandMetrics {
   contributions_community: number; contributions_operator: number; distinct_contributors: number;
   contributor_keys_issued: number;
   route_requests_total: number; route_requests_open: number; route_requests_fulfilled: number;
+  drift_alert_subscribers: number;
   zero_result_samples: { task: string; t: string }[];
   real_query_samples: { task: string; domain: string | null; t: string }[];
 }
@@ -1133,6 +1209,7 @@ async function demandMetrics(env: Env): Promise<DemandMetrics> {
   const attestTotal = attestS + attestF;
   const keysIssued = parseInt((await env.ROUTES.get("counter:keys")) ?? "0", 10);
   const rr = await routeRequestCounts(env);
+  const driftAlerts = await driftAlertCount(env);
   return {
     window: "last ≤1000 events (30-day retention)",
     queries_total: totalQ, queries_real: qReal, queries_playground: qPlayground,
@@ -1142,6 +1219,7 @@ async function demandMetrics(env: Env): Promise<DemandMetrics> {
     contributions_community: contribCommunity, contributions_operator: contribOperator,
     distinct_contributors: contributors.size, contributor_keys_issued: keysIssued,
     route_requests_total: rr.total, route_requests_open: rr.open, route_requests_fulfilled: rr.fulfilled,
+    drift_alert_subscribers: driftAlerts,
     zero_result_samples: zeroSamples, real_query_samples: realSamples,
   };
 }
@@ -1207,6 +1285,7 @@ ${card("Zero-result", `${m.queries_zero_result}`, `${(m.zero_result_rate * 100).
 ${card("Community routes", m.contributions_community, `${m.distinct_contributors} distinct contributors`)}
 ${card("Contributor keys", m.contributor_keys_issued, "issued all-time")}
 <div class="c hl"><div class="cl">Paid route requests</div><div class="cv">${m.route_requests_open}</div><div class="cs">open · ${m.route_requests_fulfilled} fulfilled · <a href="https://waymark.network/pricing">$25 route bounty</a></div></div>
+${card("Drift-alert signups", m.drift_alert_subscribers, "email capture on /drift · intake only, no sends yet")}
 </div>
 <h2>Coverage gaps — zero-result queries (what to author next)</h2>
 <ul>${zero}</ul>
@@ -1416,6 +1495,9 @@ export default {
     if (pathname === "/v1/route-requests" && request.method === "POST") return routeRequestCreate(env, request);
     if (pathname === "/admin/route-requests" && request.method === "GET") return routeRequestsList(env, request.headers.get("x-write-key"));
     if (pathname === "/admin/route-requests/fulfill" && request.method === "POST") return routeRequestFulfill(env, request.headers.get("x-write-key"), request);
+    // M7 — drift-alert email capture (intake only; no sending infra yet)
+    if (pathname === "/v1/drift-alerts" && request.method === "POST") return withServiceDesc(driftAlertCreate(env, request));
+    if (pathname === "/admin/drift-alerts" && request.method === "GET") return driftAlertsList(env, request.headers.get("x-write-key"));
     if (pathname === "/demand") return demandPageEndpoint(env);
     if (pathname === "/demand.json") return demandJsonEndpoint(env);
     if (pathname === "/contributors") return contributorsEndpoint(env, false);
@@ -1492,7 +1574,35 @@ async function recordDrift(env: Env, request: Request): Promise<Response> {
     source: String(d.source ?? "canary"),
   };
   await env.ROUTES.put(`drift:${ev.t}:${crypto.randomUUID().slice(0, 8)}`, JSON.stringify(ev), { expirationTtl: 60 * 60 * 24 * 365 });
+  // M7: maintain the compact drifted-domain set (key `idx:drift-domains`, a small
+  // JSON string[]) so route pages can show a drift-alert CTA for affected domains
+  // with ONE tiny KV read instead of a full drift: list+get scan per render.
+  // Best-effort: a failure here must never block recording the drift event itself.
+  try {
+    const raw = await env.ROUTES.get("idx:drift-domains");
+    const set = new Set<string>(raw ? (JSON.parse(raw) as string[]) : []);
+    if (!set.has(ev.domain.toLowerCase())) {
+      set.add(ev.domain.toLowerCase());
+      await env.ROUTES.put("idx:drift-domains", JSON.stringify([...set].sort()));
+    }
+  } catch { /* CTA set is cosmetic; drift event is already recorded */ }
   return Response.json({ recorded: true });
+}
+
+/** Per-isolate memo of the drifted-domain set (idx:drift-domains). 10 min TTL —
+ *  drift events are rare; staleness here only delays a cosmetic CTA. Fail-open
+ *  to an empty set so route pages render even if the key is missing/corrupt. */
+let driftDomainsMemo: { set: Set<string>; at: number } | null = null;
+async function getDriftDomains(env: Env): Promise<Set<string>> {
+  const now = Date.now();
+  if (driftDomainsMemo && now - driftDomainsMemo.at < 10 * 60 * 1000) return driftDomainsMemo.set;
+  let set = new Set<string>();
+  try {
+    const raw = await env.ROUTES.get("idx:drift-domains");
+    if (raw) set = new Set((JSON.parse(raw) as string[]).map((d) => d.toLowerCase()));
+  } catch { /* fail-open: empty set */ }
+  driftDomainsMemo = { set, at: now };
+  return set;
 }
 
 async function loadDrift(env: Env, limit = 100): Promise<DriftEvent[]> {
@@ -1615,6 +1725,28 @@ footer{color:#5b6880;font-size:12.5px;margin-top:40px}</style></head><body>
 <p class="lede">APIs change constantly — endpoints deprecate, auth models shift, required fields appear. AI agents running on training-cutoff knowledge break silently. When Waymark's canary re-verification catches a route drifting from its live API, it's logged here — timestamped, with the fix.</p>
 <div class="how"><b>How this works:</b> Waymark's canary re-executes documented API routes against the real, live APIs in verification campaigns. When a previously-working route is rejected by the live service — a deprecated endpoint, a changed parameter, a new requirement — that's <b>drift</b>, and your agents are about to fail on it. We log it, fix the route, and publish it here. Every entry below is from a real canary run, timestamped at detection — nothing is backdated or synthesized.${events.length ? ` Currently <b>${events.length}</b> logged drift event${events.length === 1 ? "" : "s"}; newest logged <b>${esc2(events[0].t.slice(0, 10))}</b>.` : ""}</div>
 ${events.length ? rows : `<div class="empty">No drift entries logged yet in this window. Entries appear when a canary verification campaign catches a live API change.</div>`}
+<div class="cta" id="alerts"><h2>Email me when an API I depend on changes</h2>
+<p style="color:var(--dim);font-size:14px">Leave your email and (optionally) the API domains you depend on — e.g. <span style="font-family:ui-monospace,monospace">stripe.com, api.github.com</span>. <b style="color:var(--text)">Honest note:</b> alert delivery hasn't launched yet — signups are recorded now, and when sending goes live you're on the list from day one. Until then, the changelog is subscribable via <a href="/drift.xml">RSS</a>.</p>
+<form id="daf" style="display:flex;flex-wrap:wrap;gap:10px;margin-top:14px">
+<input id="da-email" type="email" required placeholder="you@company.com" style="flex:1 1 200px;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px 14px;color:var(--text);font-size:14px">
+<input id="da-domains" type="text" placeholder="domains to watch (optional, comma-separated)" style="flex:2 1 260px;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px 14px;color:var(--text);font-size:14px">
+<button type="submit" style="background:linear-gradient(110deg,var(--teal),var(--indigo));border:0;border-radius:8px;padding:10px 22px;color:#0b0e14;font-weight:700;font-size:14px;cursor:pointer">Alert me</button>
+</form>
+<div id="da-msg" style="font-size:13.5px;margin-top:10px;color:var(--dim)"></div>
+<script>
+document.getElementById("daf").addEventListener("submit",async function(ev){
+  ev.preventDefault();
+  var msg=document.getElementById("da-msg");
+  msg.textContent="Saving…";msg.style.color="var(--dim)";
+  try{
+    var res=await fetch("/v1/drift-alerts",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({email:document.getElementById("da-email").value,domains:document.getElementById("da-domains").value})});
+    var j=await res.json();
+    if(res.ok){msg.textContent="✓ You're on the list. Watching: "+(Array.isArray(j.watching)?j.watching.join(", "):j.watching)+".";msg.style.color="var(--good)";}
+    else{msg.textContent=j.error||"Something went wrong — try again.";msg.style.color="var(--bad)";}
+  }catch(e){msg.textContent="Network error — try again.";msg.style.color="var(--bad)";}
+});
+</script></div>
 <div class="cta"><h2>Stop your agents from running on stale API knowledge</h2>
 <p style="color:var(--dim);font-size:14px">Waymark gives any agent community-verified routes — the current way to call an API, with the gotchas that changed and every attestation recorded in the open. One MCP install:</p>
 <code>claude mcp add --transport http waymark https://mcp.waymark.network/mcp</code></div>
@@ -2203,6 +2335,11 @@ async function routePage(env: Env, id: string): Promise<Response> {
     related = (await retrieve(env, r.task, undefined, 4)).filter((x) => x.id !== r.id).slice(0, 3);
   } catch { /* page renders fine without */ }
 
+  // M7: if this route's domain has logged API drift, surface the drift-alert
+  // funnel. One tiny memoized KV read (getDriftDomains) — never a drift: scan.
+  let domainDrifted = false;
+  try { domainDrifted = (await getDriftDomains(env)).has(r.domain.toLowerCase()); } catch { /* cosmetic */ }
+
   // Live corpus scale for the CTA. The old hardcoded "200+" was written at launch
   // and undercounted the corpus ~30× (6.4k routes) — a 30× under-claim on the most
   // shareable/indexable surface, and stale the moment a route is added. Derive it
@@ -2285,7 +2422,7 @@ footer{color:var(--dim);font-size:13px;margin-top:28px}
 <h1>${t}</h1>
 <div class="meta">domain: <b>${d}</b> · ${r.steps.length} steps · contributed by ${escapeHtml(r.contributor)}</div>
 <div class="vbadge v-${vStatus}"><span class="vp">${vProvenance}</span><span class="va">community attestations: ${r.attestations.success}✓ / ${r.attestations.failure}✗${attestPct !== null ? ` · ${attestPct}% success` : ""}${total > 0 ? ` · ${keyed} keyed / ${anon} anonymous` : ""}</span></div>
-<div class="panel"><h2>${stepsHeading}</h2><ol>${r.steps.map((s) => `<li>${escapeHtml(s)}</li>`).join("")}</ol></div>
+${domainDrifted ? `<div class="panel" style="border-left:3px solid var(--warn)"><h2 style="color:var(--warn)">This API has logged drift</h2><b>${d}</b> has changed in ways that broke documented routes before — agents on stale knowledge fail silently. <a href="https://mcp.waymark.network/drift#alerts">Get alerted when ${d} drifts again →</a></div>` : ""}<div class="panel"><h2>${stepsHeading}</h2><ol>${r.steps.map((s) => `<li>${escapeHtml(s)}</li>`).join("")}</ol></div>
 ${r.gotchas.length ? `<div class="panel g"><h2>Known gotchas</h2><ul>${r.gotchas.map((g) => `<li>${escapeHtml(g)}</li>`).join("")}</ul></div>` : ""}
 ${related.length ? `<div class="panel rel"><h2>Related routes</h2>${related.map((x) => {
     const xt = x.attestations.success + x.attestations.failure;
@@ -2462,6 +2599,19 @@ function openApiSpec(env: Env) {
             "400": { description: "Invalid or reserved handle.", content: { "application/json": { schema: { $ref: "#/components/schemas/ApiError" } } } },
             "409": { description: "Handle already registered (handles are unique, first come).", content: { "application/json": { schema: { $ref: "#/components/schemas/ApiError" } } } },
             "429": { description: "Rate limited (per-IP or network-wide).", content: { "application/json": { schema: { $ref: "#/components/schemas/ApiError" } } } },
+          },
+        },
+      },
+      "/v1/drift-alerts": {
+        post: {
+          operationId: "createDriftAlert",
+          summary: "Sign up for drift alerts on APIs you depend on (intake only)",
+          description: "Records an email + optional domain watchlist for the API Drift Tracker (/drift). Intake only: alert delivery has not launched yet — signups are stored double-opt-in-ready and honored from day one when sending goes live. Repeat signups with the same email merge the domain watchlist. Per-IP daily rate limit applies.",
+          requestBody: { required: true, content: { "application/json": { schema: { type: "object", required: ["email"], properties: { email: { type: "string", format: "email", maxLength: 120 }, domains: { description: "API domains to watch — array of strings or one comma-separated string; max 20. Empty = all drifted APIs.", oneOf: [{ type: "array", items: { type: "string", maxLength: 80 } }, { type: "string" }] } } } } } },
+          responses: {
+            "200": { description: "Signup recorded.", content: { "application/json": { schema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" }, watching: { description: "Watched domains, or the string \"all drifted APIs\".", oneOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, note: { type: "string" } } } } } },
+            "400": { description: "Invalid email.", content: { "application/json": { schema: { $ref: "#/components/schemas/ApiError" } } } },
+            "429": { description: "Rate limited (per-IP daily cap).", content: { "application/json": { schema: { $ref: "#/components/schemas/ApiError" } } } },
           },
         },
       },
