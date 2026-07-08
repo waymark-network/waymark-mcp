@@ -916,6 +916,75 @@ async function revokeKey(env: Env, adminKey: string | null, request: Request): P
   return Response.json({ revoked: true, handle: rec.handle });
 }
 
+/* ---------------- v0.7 — paid route requests (bounty intake) ----------------
+ * POST /v1/route-requests: public form target for the $25 "Route Bounty" SKU on
+ * waymark.network/pricing. Stores the request; the route factory picks open
+ * requests up hourly (authors + 100%-verifies first), and the operator emails
+ * the Stripe invoice. Deliberately no payment processing in the worker. */
+const RR_IP_DAILY_CAP = 5;
+interface RouteRequest {
+  id: string; task: string; domain: string | null; contact: string; notes: string | null;
+  status: "open" | "fulfilled" | "closed"; created: string; fulfilledAt: string | null; route_id: string | null;
+}
+
+async function routeRequestCreate(env: Env, request: Request): Promise<Response> {
+  let b: { task?: unknown; domain?: unknown; contact?: unknown; notes?: unknown } = {};
+  try { b = ((await request.json()) as typeof b) ?? {}; } catch { /* validated below */ }
+  const task = String(b.task ?? "").trim();
+  const contact = String(b.contact ?? "").trim();
+  const domain = String(b.domain ?? "").trim().slice(0, 80) || null;
+  const notes = String(b.notes ?? "").trim().slice(0, 500) || null;
+  if (task.length < 10 || task.length > 300) {
+    return Response.json({ error: "task required: 10–300 chars describing what the route should accomplish" }, { status: 400, headers: CORS });
+  }
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(contact) || contact.length > 120) {
+    return Response.json({ error: "contact required: a valid email (invoice + delivery link go there)" }, { status: 400, headers: CORS });
+  }
+  const ip = request.headers.get("cf-connecting-ip") ?? "0.0.0.0";
+  const bucket = new Date().toISOString().slice(0, 10);
+  const rlKey = `rrrl:${ip}:${bucket}`;
+  const used = parseInt((await env.ROUTES.get(rlKey)) ?? "0", 10);
+  if (used >= RR_IP_DAILY_CAP) {
+    return Response.json({ error: `rate limited: max ${RR_IP_DAILY_CAP} route requests/day from one IP` }, { status: 429, headers: CORS });
+  }
+  await env.ROUTES.put(rlKey, String(used + 1), { expirationTtl: 172800 });
+  const id = crypto.randomUUID();
+  const rec: RouteRequest = { id, task, domain, contact, notes, status: "open", created: new Date().toISOString(), fulfilledAt: null, route_id: null };
+  await env.ROUTES.put(`rr:${id}`, JSON.stringify(rec));
+  await env.ROUTES.get("counter:route_requests").then((v) => env.ROUTES.put("counter:route_requests", String(parseInt(v ?? "0", 10) + 1))).catch(() => {});
+  return Response.json({
+    id, status: "open",
+    next: "Request received. We'll confirm feasibility and email a $25 invoice within 24h; your individually verified route ships within 24h of payment.",
+  }, { headers: CORS });
+}
+
+async function routeRequestsList(env: Env, adminKey: string | null): Promise<Response> {
+  if (adminKey !== env.WRITE_KEY) return new Response("forbidden", { status: 403 });
+  const listed = await env.ROUTES.list({ prefix: "rr:", limit: 1000 });
+  const out: RouteRequest[] = [];
+  for (const k of listed.keys.slice(0, 100)) {
+    const raw = await env.ROUTES.get(k.name);
+    if (raw) { try { out.push(JSON.parse(raw) as RouteRequest); } catch { /* skip corrupt */ } }
+  }
+  out.sort((a, b) => (a.created < b.created ? 1 : -1));
+  return Response.json({ total: out.length, open: out.filter((r) => r.status === "open").length, requests: out });
+}
+
+async function routeRequestFulfill(env: Env, adminKey: string | null, request: Request): Promise<Response> {
+  if (adminKey !== env.WRITE_KEY) return new Response("forbidden", { status: 403 });
+  let body: { id?: string; route_id?: string; status?: string };
+  try { body = await request.json(); } catch { return Response.json({ error: "bad json" }, { status: 400 }); }
+  const id = String(body.id ?? "");
+  const raw = id ? await env.ROUTES.get(`rr:${id}`) : null;
+  if (!raw) return Response.json({ error: "not found" }, { status: 404 });
+  const rec = JSON.parse(raw) as RouteRequest;
+  rec.status = body.status === "closed" ? "closed" : "fulfilled";
+  rec.fulfilledAt = new Date().toISOString();
+  rec.route_id = body.route_id ? String(body.route_id) : rec.route_id;
+  await env.ROUTES.put(`rr:${id}`, JSON.stringify(rec));
+  return Response.json({ ok: true, request: rec });
+}
+
 /* ---------------- Demand dashboard (v0.6) ----------------
  * Route COUNT is a supply/vanity metric. /demand tracks the numbers that show a
  * network actually forming: real (non-playground) agent queries, coverage gaps
@@ -1253,6 +1322,10 @@ export default {
     // v0.6 — self-serve contributor keys + demand dashboard
     if (pathname === "/v1/keys" && request.method === "POST") return withServiceDesc(issueKeyHttp(env, request));
     if (pathname === "/admin/revoke-key" && request.method === "POST") return revokeKey(env, request.headers.get("x-write-key"), request);
+    // v0.7 — paid route requests (bounty intake for /pricing)
+    if (pathname === "/v1/route-requests" && request.method === "POST") return routeRequestCreate(env, request);
+    if (pathname === "/admin/route-requests" && request.method === "GET") return routeRequestsList(env, request.headers.get("x-write-key"));
+    if (pathname === "/admin/route-requests/fulfill" && request.method === "POST") return routeRequestFulfill(env, request.headers.get("x-write-key"), request);
     if (pathname === "/demand") return demandPageEndpoint(env);
     if (pathname === "/demand.json") return demandJsonEndpoint(env);
     if (pathname === "/contributors") return contributorsEndpoint(env, false);
