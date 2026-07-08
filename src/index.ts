@@ -560,12 +560,14 @@ export class WaymarkMCP extends McpAgent<Env> {
             return { content: [{ type: "text" as const, text: "Invalid or revoked API key. Get a free contributor key: call waymark_register, or POST https://mcp.waymark.network/v1/keys {\"handle\":\"your-agent\"}." }], isError: true };
           }
           // Per-key hourly contribution cap — bounds corpus poisoning by any one key.
+          // Tier-aware (M1): pro keys get 10× the free cap.
           const kb = new Date().toISOString().slice(0, 13); // YYYY-MM-DDTHH
           const kRl = `ckcrl:${keyRec.storeKey.slice(3)}:${kb}`;
           const kUsed = parseInt((await env.ROUTES.get(kRl)) ?? "0", 10);
-          if (kUsed >= CONTRIB_KEY_HOURLY_CAP) {
+          const kCap = contribCapFor(keyRec.rec);
+          if (kUsed >= kCap) {
             await logEvent(env, "contribute", { rejected: "rate_capped", domain });
-            return { content: [{ type: "text" as const, text: JSON.stringify({ status: "rate_capped", detail: `Per-key cap of ${CONTRIB_KEY_HOURLY_CAP} contributions/hour reached. Retry later.` }) }], isError: true };
+            return { content: [{ type: "text" as const, text: JSON.stringify({ status: "rate_capped", detail: `Per-key cap of ${kCap} contributions/hour reached. Retry later.` }) }], isError: true };
           }
           await env.ROUTES.put(kRl, String(kUsed + 1), { expirationTtl: 7200 });
         }
@@ -811,7 +813,13 @@ function conditional(request: Request, body: string, etag: string, headers: Reco
  *     priority) until the canary re-verifies — same trust model as before.
  *   - WRITE_KEY remains the admin/factory path, unchanged and separate. */
 
-const CONTRIB_KEY_HOURLY_CAP = 20;        // sanitized routes per key per hour
+const CONTRIB_KEY_HOURLY_CAP = 20;        // sanitized routes per key per hour (free tier)
+// v0.7 monetization (M1): Pro tier ($19/mo, waymark.network/pricing) = 10× the
+// free per-key hourly contribute cap + priority placement in the factory's
+// verification queue (/admin/priority-queue). Key records without `tier` are
+// free (all pre-M1 keys). Upgrades are operator-only (POST /admin/upgrade-key,
+// WRITE_KEY-gated) after Stripe payment — deliberately no payment logic in-worker.
+const PRO_CAP_MULTIPLIER = 10;
 const KEY_ISSUE_IP_HOURLY_CAP = 5;        // new keys per IP per hour (HTTP path)
 // Network-wide new-key ceiling/hour. Bounds the MCP register path (which has no
 // per-IP attribution) — worst case now ~50 keys × 20 = 1000 *unverified* writes/hr,
@@ -823,7 +831,13 @@ const KEY_ISSUE_GLOBAL_HOURLY_CAP = 50;
 /** Reserved handles an external key may not claim (anti-impersonation, review #8). */
 const RESERVED_HANDLE = /(^|[^a-z])(waymark|operator|official|admin|staff|mc[\s_-]?software)([^a-z]|$)|seed/i;
 
-interface ContribKey { handle: string; created: string; revoked: boolean; contributions: number; lastAt: string | null }
+/** `tier` absent ⇒ "free" (back-compat: all pre-M1 records). */
+interface ContribKey { handle: string; created: string; revoked: boolean; contributions: number; lastAt: string | null; tier?: "free" | "pro" }
+
+/** Effective per-key hourly contribute cap for a key record (M1 entitlement). */
+function contribCapFor(rec: ContribKey): number {
+  return rec.tier === "pro" ? CONTRIB_KEY_HOURLY_CAP * PRO_CAP_MULTIPLIER : CONTRIB_KEY_HOURLY_CAP;
+}
 
 async function sha256hex(s: string): Promise<string> {
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
@@ -914,6 +928,53 @@ async function revokeKey(env: Env, adminKey: string | null, request: Request): P
   rec.revoked = true;
   await env.ROUTES.put(storeKey, JSON.stringify(rec));
   return Response.json({ revoked: true, handle: rec.handle });
+}
+
+/** POST /admin/upgrade-key {key|key_hash, tier:"free"|"pro"} — WRITE_KEY-gated (M1).
+ * The operator flips a key's tier after Stripe payment for the $19/mo Pro SKU
+ * (waymark.network/pricing); "free" downgrades on churn. No payment logic in-worker. */
+async function upgradeKey(env: Env, adminKey: string | null, request: Request): Promise<Response> {
+  if (adminKey !== env.WRITE_KEY) return new Response("forbidden", { status: 403 });
+  let body: { key?: string; key_hash?: string; tier?: string };
+  try { body = await request.json(); } catch { return Response.json({ error: "bad json" }, { status: 400 }); }
+  const tier = body.tier;
+  if (tier !== "free" && tier !== "pro") return Response.json({ error: 'tier required: "free" | "pro"' }, { status: 400 });
+  let storeKey: string | null = null;
+  if (body.key) { const r = await lookupContribKey(env, body.key); storeKey = r?.storeKey ?? null; }
+  else if (body.key_hash && /^[0-9a-f]{64}$/.test(body.key_hash)) storeKey = `ck:${body.key_hash}`;
+  if (!storeKey) return Response.json({ error: "provide a valid key or key_hash" }, { status: 400 });
+  const raw = await env.ROUTES.get(storeKey);
+  if (!raw) return Response.json({ upgraded: false, reason: "not found" }, { status: 404 });
+  const rec = JSON.parse(raw) as ContribKey;
+  rec.tier = tier;
+  await env.ROUTES.put(storeKey, JSON.stringify(rec));
+  return Response.json({ upgraded: true, handle: rec.handle, tier, hourly_contribute_cap: contribCapFor(rec) });
+}
+
+/** GET /admin/priority-queue — WRITE_KEY-gated (M1). Unverified routes from
+ * active pro-tier contributors, newest first — the factory verifies these ahead
+ * of the general pool (the paid entitlement). Same consumption pattern as
+ * /admin/route-requests. Full ck: scan + fat-index read: fine at current key
+ * counts for an operator-only endpoint; revisit if keys grow past ~1000. */
+async function priorityQueueList(env: Env, adminKey: string | null): Promise<Response> {
+  if (adminKey !== env.WRITE_KEY) return new Response("forbidden", { status: 403 });
+  const listed = await env.ROUTES.list({ prefix: "ck:", limit: 1000 });
+  const proHandles = new Set<string>();
+  for (const k of listed.keys) {
+    const raw = await env.ROUTES.get(k.name);
+    if (!raw) continue;
+    try {
+      const rec = JSON.parse(raw) as ContribKey;
+      if (rec.tier === "pro" && !rec.revoked) proHandles.add(rec.handle);
+    } catch { /* skip corrupt */ }
+  }
+  const idx = await getIndex(env);
+  const queue = idx
+    .filter((r) => proHandles.has(r.contributor) && (r.verification?.status ?? "sampled") === "unverified")
+    .sort((a, b) => (a.created < b.created ? 1 : -1))
+    .slice(0, 200)
+    .map((r) => ({ id: r.id, task: r.task, domain: r.domain, contributor: r.contributor, created: r.created, priority: true }));
+  return Response.json({ pro_contributors: proHandles.size, open: queue.length, queue });
 }
 
 /* ---------------- v0.7 — paid route requests (bounty intake) ----------------
@@ -1322,6 +1383,9 @@ export default {
     // v0.6 — self-serve contributor keys + demand dashboard
     if (pathname === "/v1/keys" && request.method === "POST") return withServiceDesc(issueKeyHttp(env, request));
     if (pathname === "/admin/revoke-key" && request.method === "POST") return revokeKey(env, request.headers.get("x-write-key"), request);
+    // v0.7 monetization (M1) — Pro key entitlements
+    if (pathname === "/admin/upgrade-key" && request.method === "POST") return upgradeKey(env, request.headers.get("x-write-key"), request);
+    if (pathname === "/admin/priority-queue" && request.method === "GET") return priorityQueueList(env, request.headers.get("x-write-key"));
     // v0.7 — paid route requests (bounty intake for /pricing)
     if (pathname === "/v1/route-requests" && request.method === "POST") return routeRequestCreate(env, request);
     if (pathname === "/admin/route-requests" && request.method === "GET") return routeRequestsList(env, request.headers.get("x-write-key"));
