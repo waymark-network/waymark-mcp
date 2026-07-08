@@ -1073,8 +1073,31 @@ interface DemandMetrics {
   attestations: number; attest_success: number; attest_failure: number; attest_rate_per_real_query: number;
   contributions_community: number; contributions_operator: number; distinct_contributors: number;
   contributor_keys_issued: number;
+  route_requests_total: number; route_requests_open: number; route_requests_fulfilled: number;
   zero_result_samples: { task: string; t: string }[];
   real_query_samples: { task: string; domain: string | null; t: string }[];
+}
+
+/** Counts of paid route requests ($25 bounty intake, v0.7) by status. Counts
+ *  only — task/contact/notes stay private (contact is PII; this feeds public
+ *  /demand surfaces). Reads ≤200 rr: records per call; /demand caches 60s, so
+ *  KV read load is trivial at current volume — revisit past ~200 requests. */
+async function routeRequestCounts(env: Env): Promise<{ total: number; open: number; fulfilled: number }> {
+  try {
+    const listed = await env.ROUTES.list({ prefix: "rr:", limit: 1000 });
+    let open = 0, fulfilled = 0;
+    for (const k of listed.keys.slice(0, 200)) {
+      const raw = await env.ROUTES.get(k.name);
+      if (!raw) continue;
+      try {
+        const rec = JSON.parse(raw) as RouteRequest;
+        if (rec.status === "open") open++; else if (rec.status === "fulfilled") fulfilled++;
+      } catch { /* skip corrupt */ }
+    }
+    return { total: listed.keys.length, open, fulfilled };
+  } catch {
+    return { total: 0, open: 0, fulfilled: 0 }; // demand page must render even if rr: scan fails
+  }
 }
 
 async function demandMetrics(env: Env): Promise<DemandMetrics> {
@@ -1109,6 +1132,7 @@ async function demandMetrics(env: Env): Promise<DemandMetrics> {
   const totalQ = qReal + qPlayground;
   const attestTotal = attestS + attestF;
   const keysIssued = parseInt((await env.ROUTES.get("counter:keys")) ?? "0", 10);
+  const rr = await routeRequestCounts(env);
   return {
     window: "last ≤1000 events (30-day retention)",
     queries_total: totalQ, queries_real: qReal, queries_playground: qPlayground,
@@ -1117,6 +1141,7 @@ async function demandMetrics(env: Env): Promise<DemandMetrics> {
     attest_rate_per_real_query: qReal ? +(attestTotal / qReal).toFixed(3) : 0,
     contributions_community: contribCommunity, contributions_operator: contribOperator,
     distinct_contributors: contributors.size, contributor_keys_issued: keysIssued,
+    route_requests_total: rr.total, route_requests_open: rr.open, route_requests_fulfilled: rr.fulfilled,
     zero_result_samples: zeroSamples, real_query_samples: realSamples,
   };
 }
@@ -1168,7 +1193,7 @@ li:last-child{border-bottom:0}.q{color:var(--text);font-family:ui-monospace,mono
 .note{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--indigo);border-radius:10px;padding:14px 18px;color:var(--dim);font-size:13.5px;margin:24px 0 0}
 .note b{color:var(--text)}
 footer{color:#5b6880;font-size:12.5px;margin-top:34px}</style></head><body>
-<nav><div class="logo">waymark</div><div><a class="lk" href="/dashboard">Network</a><a class="lk" href="/drift">Drift</a><a class="lk" href="/contributors">Contributors</a><a class="lk" href="/demand.json">JSON</a><a class="lk" href="https://waymark.network">waymark.network</a></div></nav>
+<nav><div class="logo">waymark</div><div><a class="lk" href="/dashboard">Network</a><a class="lk" href="/drift">Drift</a><a class="lk" href="/contributors">Contributors</a><a class="lk" href="https://waymark.network/pricing">Pricing</a><a class="lk" href="/demand.json">JSON</a><a class="lk" href="https://waymark.network">waymark.network</a></div></nav>
 <h1>Demand, not supply.</h1>
 <p class="lede">Route count is a supply metric. These are the numbers that show a network forming: real agent queries, coverage gaps, attestations, and external contributions.</p>
 <p class="win">Window: ${esc2(m.window)}</p>
@@ -1181,6 +1206,7 @@ ${card("Zero-result", `${m.queries_zero_result}`, `${(m.zero_result_rate * 100).
 <div class="c hl"><div class="cl">Attestation rate</div><div class="cv">${m.attest_rate_per_real_query}</div><div class="cs">per real query · ${m.attestations} total (${m.attest_success}✓/${m.attest_failure}✗)</div></div>
 ${card("Community routes", m.contributions_community, `${m.distinct_contributors} distinct contributors`)}
 ${card("Contributor keys", m.contributor_keys_issued, "issued all-time")}
+<div class="c hl"><div class="cl">Paid route requests</div><div class="cv">${m.route_requests_open}</div><div class="cs">open · ${m.route_requests_fulfilled} fulfilled · <a href="https://waymark.network/pricing">$25 route bounty</a></div></div>
 </div>
 <h2>Coverage gaps — zero-result queries (what to author next)</h2>
 <ul>${zero}</ul>
@@ -1949,7 +1975,7 @@ footer{color:var(--dim);font-size:13px;margin-top:28px}</style></head><body>
 <input id="q" type="search" placeholder="Filter domains — e.g. stripe, salesforce, aws…" autocomplete="off" aria-label="Filter domains">
 <p id="none">No domain matches. Try the <a href="/dashboard">semantic search on the dashboard</a> for task-level lookup.</p>
 <div class="grid">${cards}</div>
-<footer>Waymark — the shared route map of the agent economy · <code>claude mcp add --transport http waymark https://mcp.waymark.network/mcp</code></footer>
+<footer>Waymark — the shared route map of the agent economy · <a href="https://waymark.network/pricing">request a route ($25)</a> · <code>claude mcp add --transport http waymark https://mcp.waymark.network/mcp</code></footer>
 <script>
 var q=document.getElementById("q"),cards=[].slice.call(document.querySelectorAll(".dom")),none=document.getElementById("none");
 q.addEventListener("input",function(){
@@ -2059,7 +2085,7 @@ footer{color:var(--dim);font-size:13px;margin-top:28px}</style></head><body>
 <input id="q" type="search" placeholder="Filter these routes — e.g. webhook, oauth, rate limit…" autocomplete="off" aria-label="Filter routes">
 <p id="none">No routes match. Try the <a href="/dashboard">semantic search on the dashboard</a> — keyword filtering here is exact-match only.</p>
 ${sections}
-<footer>Waymark — the shared route map of the agent economy · <code>claude mcp add --transport http waymark https://mcp.waymark.network/mcp</code></footer>
+<footer>Waymark — the shared route map of the agent economy · <a href="https://waymark.network/pricing">request a route ($25)</a> · <code>claude mcp add --transport http waymark https://mcp.waymark.network/mcp</code></footer>
 <script>
 var q=document.getElementById("q"),rows=[].slice.call(document.querySelectorAll("a.row")),none=document.getElementById("none");
 q.addEventListener("input",function(){
@@ -2269,7 +2295,7 @@ ${related.length ? `<div class="panel rel"><h2>Related routes</h2>${related.map(
 <div class="panel cta"><h2>Give your agent this knowledge — and ${scaleMore} routes</h2>
 One MCP install gives any agent live access to the full route map${scaleDomains}, with trust scores updated by agent consensus:
 <code>claude mcp add --transport http waymark https://mcp.waymark.network/mcp</code></div>
-<footer>Waymark — the shared route map of the agent economy · <a href="https://mcp.waymark.network/dashboard">live dashboard</a> · <a href="https://waymark.network/benchmark">benchmark</a> · <a href="${pageUrl}.json">this route as JSON</a></footer>
+<footer>Waymark — the shared route map of the agent economy · <a href="https://mcp.waymark.network/dashboard">live dashboard</a> · <a href="https://waymark.network/benchmark">benchmark</a> · <a href="https://waymark.network/pricing">request a route ($25)</a> · <a href="${pageUrl}.json">this route as JSON</a></footer>
 </body></html>`;
   return new Response(html, { headers: { "Content-Type": "text/html;charset=utf-8", "Cache-Control": "public, max-age=300" } });
 }
@@ -2644,6 +2670,7 @@ footer a{color:var(--teal);text-decoration:none}
     <span class="mono" id="ts">…</span>
     <a href="https://waymark.network">site</a>
     <a href="https://waymark.network/benchmark">benchmark</a>
+    <a href="https://waymark.network/pricing">pricing</a>
   </div>
 </header>
 
