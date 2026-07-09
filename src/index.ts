@@ -544,10 +544,20 @@ export class WaymarkMCP extends McpAgent<Env> {
           task: z.string().describe("Natural-language description of the task you are about to attempt"),
           domain: z.string().optional().describe("Optional service/site hint, e.g. 'stripe.com'"),
           limit: z.number().int().min(1).max(10).default(3),
+          // Mirror of /search?probe=1 (item 60) for the MCP path: our own
+          // smoke/eval/benchmark tooling self-identifies so demand telemetry
+          // (queries_real vs queries_probe on /demand) separates internal
+          // traffic from outside agents. Filed as item 61 after the 2026-07-08
+          // benchmark-fleet MCP queries (domain:null) inflated queries_real.
+          // Public + documented on purpose — same as /search: a caller setting
+          // it can only UNDERcount demand, never inflate it.
+          probe: z.boolean().optional().describe(
+            "Set true only by Waymark's own smoke/eval/benchmark tooling so demand telemetry can separate internal probes from real agent queries"
+          ),
         },
         annotations: { readOnlyHint: true, openWorldHint: false },
       },
-      async ({ task, domain, limit }) => {
+      async ({ task, domain, limit, probe }) => {
         // Best-effort query counter (KV is not atomic; fine for alpha stats).
         // Kicked off here so it overlaps retrieval, but MUST be awaited before
         // returning — un-awaited writes get cancelled (see logEvent docs).
@@ -573,8 +583,12 @@ export class WaymarkMCP extends McpAgent<Env> {
         await Promise.all([
           counterWrite,
           logEvent(env, "query", {
+            // probe=true overrides the *event label* only — retrieval above
+            // still uses the real domain hint, so probe callers get identical
+            // results to real agents (a benchmark that changed retrieval
+            // behavior would measure nothing).
             task: task.slice(0, 140),
-            domain: domain ?? null,
+            domain: probe ? "probe" : (domain ?? null),
             results: ranked.length,
             ms: retrievalMs,
           }),
