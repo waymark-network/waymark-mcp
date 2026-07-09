@@ -259,6 +259,63 @@ const VEC_MIN_SCORE = 0.62; // calibrated: exact ~0.94, intended paraphrase ≥~
  * noise (e.g. Criteo auth for a Gmail query); every intended route scores ≥0.7165
  * or is lexically grounded, so raising the bypass costs nothing measured. */
 const VEC_HIGH_CONF = 0.70; // near-exact only; paraphrases rely on grounding (they have it)
+
+/* Coherence gate (item 59, 2026-07-09). The item-40 grounding gate can't catch
+ * queries whose every match GENUINELY shares a token — tech-adjacent salad
+ * ("webhook oauth kubernetes banana pipeline toaster deploy"), single-real-word
+ * noise ("kafka blorptastic …"), and cross-domain mashups ("refund a github pull
+ * request using twilio row level security") all served 3–5 routes. Evidence
+ * (eval/vec-score-audit-20260709-0541.json, 8,602-route corpus): no threshold
+ * separates them — the worst salad tops at 0.7235 while the weakest legit top
+ * (oauth-refresh) is 0.7165. What DOES separate them, measured on all 34 eval
+ * cases (20 golden + 18 serve + 13 garbage + 3 legit compound — 0 errors offline):
+ *   1. Every golden/legit query's top serve ≥ 0.7612; every leak ≤ 0.7235.
+ *      So the gate only runs in the low-confidence band top < VEC_STRONG=0.745
+ *      (margins: worst leak +0.021 inside, closest legit compound-3 at 0.7629
+ *      +0.018 outside). Strong-topped queries are untouched.
+ *   2. Salad/noise queries contain ≥2 content tokens that appear NOWHERE in the
+ *      corpus (banana+toaster, synergy+capacitor, 4× blorptastic-class); legit
+ *      queries measured 0–1 (compound-1's "merges" — hence the naive stem
+ *      fallback, which maps it to "merge"). NONSENSE gate: ≥2 unknown → refuse.
+ *   3. Mashups ground DIFFERENT candidates on DIFFERENT fragments: their best
+ *      anchor token covers ≤0.462 of served candidates (mashup-1 github 6/13,
+ *      mashup-2 kafka 5/12), while in-band legit queries concentrate ≥0.50
+ *      (postgres-notnull 0.500, compound-1 0.667, oauth-refresh 0.929).
+ *      ANCHOR gate: best-anchor share < 0.48 → refuse. Margins are thin
+ *      (±0.02) by nature of the measured gap — the eval harness guards drift;
+ *      re-run vec-score-audit.mjs + refusal-eval.mjs after major corpus growth.
+ * Refusal here is HARD (no keyword fallback): vector candidates existed but the
+ * query itself is incoherent, and the keyword path would re-serve mashup
+ * fragments. A wrong route is worse than no route. */
+const VEC_STRONG = 0.745;
+const ANCHOR_MIN_SHARE = 0.48;
+const NONSENSE_MIN = 2;
+const COHERENCE_STOP = new Set([
+  "using", "with", "from", "into", "when", "that", "this", "without",
+  "your", "their", "have", "what", "does", "should",
+]);
+/** Returns a refusal reason if an in-band query is incoherent, else null. */
+function coherenceRefusal(query: string, domainHint: string | undefined, kept: Route[], idx: IdxEntry[]): string | null {
+  const qTok = [...contentTokens(query + " " + (domainHint ?? ""))].filter((t) => !COHERENCE_STOP.has(t));
+  if (qTok.length === 0) return null;
+  // Nonsense gate: ≥2 query tokens unknown to the entire corpus (stem-tolerant).
+  const known = new Set<string>();
+  for (const e of idx) for (const t of contentTokens(e.task + " " + e.domain)) known.add(t);
+  const stem = (t: string) => t.replace(/(ing|ed|es|s)$/, "");
+  const nonsense = qTok.filter((t) => !known.has(t) && !known.has(stem(t)));
+  if (nonsense.length >= NONSENSE_MIN) return "nonsense-tokens:" + nonsense.join(",");
+  // Anchor-dispersion gate: no single query token grounds ≥48% of candidates.
+  const cnt = new Map<string, number>();
+  for (const r of kept) {
+    const rt = contentTokens(r.task + " " + r.domain);
+    for (const t of qTok) if (rt.has(t)) cnt.set(t, (cnt.get(t) ?? 0) + 1);
+  }
+  let max = 0;
+  for (const v of cnt.values()) if (v > max) max = v;
+  if (max / kept.length < ANCHOR_MIN_SHARE) return "anchor-dispersion:" + (max / kept.length).toFixed(3);
+  return null;
+}
+
 const contentTokens = (s: string) =>
   new Set(s.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length > 3));
 function lexicallyGrounded(query: string, domainHint: string | undefined) {
@@ -327,6 +384,12 @@ async function retrieve(env: Env, query: string, domainHint: string | undefined,
         const grounded = lexicallyGrounded(query, domainHint);
         const kept = routes.filter((r) => (score.get(r.id) ?? 0) >= VEC_HIGH_CONF || grounded(r));
         if (kept.length > 0) {
+          // Coherence gate (item 59): in the low-confidence band, refuse
+          // incoherent queries HARD — see coherenceRefusal doc for evidence.
+          const topScore = Math.max(...kept.map((r) => score.get(r.id) ?? 0));
+          if (topScore < VEC_STRONG && coherenceRefusal(query, domainHint, kept, await getIndex(env)) !== null) {
+            return [];
+          }
           // BLOCKER #1: re-rank by verification-adjusted score so a verified route
           // always outranks an unverified one at similar semantic distance.
           kept.sort((a, b) => servingScore(b, score.get(b.id) ?? 0) - servingScore(a, score.get(a.id) ?? 0));
