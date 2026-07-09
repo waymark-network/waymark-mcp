@@ -231,7 +231,12 @@ async function fetchRoutes(env: Env, ids: string[]): Promise<Route[]> {
  * is empty/unavailable. Confidence cutoff retained: no route > wrong route. */
 
 const EMBED_MODEL = "@cf/baai/bge-base-en-v1.5";
-const VEC_MIN_SCORE = 0.56; // calibrated: exact ~0.94, paraphrase ~0.60+, garbage ≤0.49
+/* 0.56→0.62 recalibrated 2026-07-08 (backlog item 41) from REST-audited marginal
+ * scores (eval/vec-score-audit.mjs, 7,612-route corpus): every golden expected
+ * route scores ≥0.7661, weakest legit top result 0.7165, while the last grounded
+ * keyword-salad survivor ("…nonsense tokens here") scored 0.6011. 0.62 excludes
+ * it with zero measured loss in any legit top-5 (audited at 0.60/0.61/0.62). */
+const VEC_MIN_SCORE = 0.62; // calibrated: exact ~0.94, intended paraphrase ≥~0.72, garbage ≤0.61
 
 /* Vector-path grounding gate (refusal hardening, 2026-06-19).
  * As the corpus grew (3.8k→6.4k routes), the bge ranker began returning
@@ -248,7 +253,12 @@ const VEC_MIN_SCORE = 0.56; // calibrated: exact ~0.94, paraphrase ~0.60+, garba
  * false-serve garbage query shares 0 content tokens with every one of its
  * matches, so it is fully gated. Near-exact matches (≥VEC_HIGH_CONF) bypass the
  * check so genuine pure-semantic hits still serve. */
-const VEC_HIGH_CONF = 0.66; // near-exact only; paraphrases (~0.60) rely on grounding (they have it)
+/* 0.66→0.70 recalibrated 2026-07-08 (item 41): an UNGROUNDED garbage match scored
+ * 0.6685 and slipped through this bypass. Audit shows the only ungrounded matches
+ * in the 0.66–0.70 band across all 38 legit eval queries are related-but-wrong
+ * noise (e.g. Criteo auth for a Gmail query); every intended route scores ≥0.7165
+ * or is lexically grounded, so raising the bypass costs nothing measured. */
+const VEC_HIGH_CONF = 0.70; // near-exact only; paraphrases rely on grounding (they have it)
 const contentTokens = (s: string) =>
   new Set(s.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length > 3));
 function lexicallyGrounded(query: string, domainHint: string | undefined) {
@@ -575,6 +585,13 @@ export class WaymarkMCP extends McpAgent<Env> {
           await logEvent(env, "contribute", { rejected: "sensitive_content", domain });
           return { content: [{ type: "text" as const, text: "Rejected: submission appears to contain credentials/secrets. Sanitize and resubmit procedure-only content." }], isError: true };
         }
+        // Item 24 v1: malicious-content screen — applies to community AND
+        // operator/factory contributions (see looksMalicious doc-comment).
+        const malicious = looksMalicious([task, domain, ...steps, ...gotchas].join("\n"));
+        if (malicious) {
+          await logEvent(env, "contribute", { rejected: "malicious_content", rule: malicious, domain });
+          return { content: [{ type: "text" as const, text: `Rejected (${malicious}): submission matched Waymark's write-time content screen (exfiltration sinks, public-IP URLs, insecure pipe-to-shell, or instructions targeting the consuming agent). If this is a false positive, rephrase the flagged step or contact security@waymark.network.` }], isError: true };
+        }
         // Attribution: for self-serve keys, trust the registered handle, not a
         // free-text field the caller could spoof.
         const handle = isAdmin ? contributor : (keyRec!.rec.handle || contributor);
@@ -750,6 +767,51 @@ async function loadRecentEvents(env: Env, limit: number): Promise<ActivityEvent[
 /** Crude secret detector for the alpha; replace with SDK-level sanitization. */
 function looksSensitive(s: string): boolean {
   return /(sk-[a-zA-Z0-9]{16,}|AKIA[0-9A-Z]{16}|-----BEGIN|password\s*[:=]|bearer\s+[a-z0-9._-]{20,})/i.test(s);
+}
+
+/* ---- Write-time malicious-content screen (item 24, v1) ----
+ * Routes are text CONSUMED AND EXECUTED by other agents, so a poisoned route
+ * is both an exfiltration vector (steps directing output/credentials to an
+ * attacker sink) and a prompt-injection vector (steps instructing the
+ * consuming agent itself). Screen every contribution — community AND
+ * operator/factory (the factory ingests scraped web docs, which can carry
+ * injection) — and reject loudly with the rule name; rejections are logged
+ * publicly as contribute events (rejected:"malicious_content").
+ *
+ * Every rule was calibrated 2026-07-08 against the FULL live corpus
+ * (7,925 routes, full step/gotcha text): 0 false positives. Deliberately
+ * NOT included, with evidence:
+ *  - https pipe-to-shell from named domains (3 legit official installers in
+ *    corpus: syft, grype, linkerd) — only http:// or IP-literal → shell flags;
+ *  - ngrok domains — canonical legit webhook-dev tooling;
+ *  - bare "exfiltrate" (2 legit security-docs routes) and "send the token to"
+ *    (legit OAuth/Play-Integrity phrasing) — the credential rule requires the
+ *    possessive form ("send YOUR api key to").
+ * Deferred to a later run (item 24 full scope): npm/pip advisory lookups,
+ * malicious-domain reputation feeds. Returns the rule name, or null if clean. */
+const EXFIL_SINKS = /\b(webhook\.site|requestbin\.(com|net)|m\.pipedream\.net|burpcollaborator\.net|oastify\.com|oast\.(pro|fun|live|site|online|me)|interact\.sh|interactsh\.com|canarytokens?\.(com|org)|beeceptor\.com|hookbin\.com|postb\.in|requestcatcher\.com|requestinspector\.com|ptsv2\.com|webhook-test\.com)\b/i;
+const IP_URL = /https?:\/\/(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}/gi;
+const PIPE_SH = /\b(curl|wget)\b[^\n|;]{0,300}\|\s*(sudo\s+)?(ba|z|da)?sh\b/i;
+function hasPublicIpUrl(s: string): boolean {
+  for (const m of s.matchAll(IP_URL)) {
+    const a = +m[1], b = +m[2];
+    // Loopback/private/link-local are legit in docs (OAuth loopback redirect
+    // URIs, local dev examples) — only a PUBLIC IP-literal URL is flagged.
+    if (a === 127 || a === 10 || a === 0 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31) || (a === 169 && b === 254)) continue;
+    return true;
+  }
+  return false;
+}
+function looksMalicious(s: string): string | null {
+  if (EXFIL_SINKS.test(s)) return "exfil_sink_domain";
+  if (hasPublicIpUrl(s)) return "public_ip_url";
+  const pipe = s.match(PIPE_SH);
+  if (pipe && (/http:\/\//i.test(pipe[0]) || hasPublicIpUrl(pipe[0]))) return "insecure_pipe_to_shell";
+  if (/base64\s+(-d|--decode)[^\n|;]{0,100}\|\s*(sudo\s+)?(ba|z)?sh\b/i.test(s)) return "b64_to_shell";
+  if (/\b(ignore|disregard|forget)\s+(all\s+|any\s+)?(previous|prior|above|earlier)\s+(instructions?|messages?|prompts?|rules?)\b/i.test(s)) return "prompt_injection";
+  if (/\b(send|post|forward|upload|transmit|exfiltrate)\s+(your|all\s+your)\s+(api[\s_-]?keys?|credentials?|secrets?|passwords?|tokens?)\s+to\b/i.test(s)) return "credential_exfil_instruction";
+  if (/\bdo\s+not\s+(tell|inform|alert|notify)\s+the\s+(user|human|operator)\b/i.test(s)) return "concealment_instruction";
+  return null;
 }
 
 function serverCard(env: Env) {
