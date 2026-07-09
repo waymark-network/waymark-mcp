@@ -819,10 +819,27 @@ async function loadAllRoutes(env: Env): Promise<Route[]> {
   return out;
 }
 
-/** Newest-first recent events. ISO-prefixed keys sort ascending; take the tail. */
+/** Newest-first recent events. ISO-prefixed keys sort ascending; take the tail.
+ *
+ *  [P0 fixed 2026-07-09] KV list() pages are lexicographic (oldest-first) and
+ *  silently cap at 1000 keys — a single call returns the OLDEST 1000 events
+ *  once the log exceeds 1000, freezing /activity, /demand, /dashboard and the
+ *  homepage demand section at the moment the cap is crossed (observed live:
+ *  feed stuck at 03:40Z with events_30d=1034). Paginate to the final page,
+ *  keeping a rolling tail, so we always return the newest `limit` events.
+ *  Cost: ceil(total/1000) list calls per load (2 today, behind 15–60s response
+ *  caches). If the 30-day window grows past ~10k events, replace with
+ *  reverse-sortable keys (newest-first prefix) for a single-page read. */
 async function loadRecentEvents(env: Env, limit: number): Promise<ActivityEvent[]> {
-  const list = await env.ROUTES.list({ prefix: "evt:", limit: 1000 });
-  const keys = list.keys.slice(-limit).reverse();
+  let cursor: string | undefined;
+  let tail: { name: string }[] = [];
+  for (let page = 0; page < 50; page++) {
+    const list = await env.ROUTES.list({ prefix: "evt:", limit: 1000, ...(cursor ? { cursor } : {}) });
+    if (list.keys.length) tail = tail.concat(list.keys).slice(-limit);
+    if (list.list_complete) break;
+    cursor = list.cursor;
+  }
+  const keys = tail.reverse();
   const values = await Promise.all(keys.map((k) => env.ROUTES.get(k.name)));
   return values.filter((v): v is string => v !== null).map((v) => JSON.parse(v));
 }
@@ -1252,23 +1269,112 @@ async function driftAlertsList(env: Env, adminKey: string | null): Promise<Respo
  * (zero-result queries), attestation rate, community contributions, and keys
  * issued. Computed from the activity log (≤1000 recent events, 30-day TTL). */
 
-const PLAYGROUND_DOMAINS = new Set(["web-playground", "playground"]);
+/** "probe" (2026-07-09): our own smoke/eval/build tooling now self-identifies
+ *  with `GET /search?...&probe=1` and is logged under domain "probe" instead of
+ *  "web-playground" — so human playground visitors (e.g. the HN-launch traffic)
+ *  and our own probes are finally separable in demand telemetry. */
+const PLAYGROUND_DOMAINS = new Set(["web-playground", "playground", "probe"]);
 
 /** Synthetic / non-organic query traffic that must never count as real demand
  *  or as a coverage gap: homepage playground demo + smoke-suite probes (both
  *  logged under "web-playground", incl. the intentional `purple monkey
- *  dishwasher` zero-result probe) and e2e loop-test traffic (domains like
- *  "example-e2e.invalid"). Mirrors the homepage's isRealDemand() filter so the
- *  landing page and /demand agree on what counts as real demand. */
+ *  dishwasher` zero-result probe), self-labeled probes ("probe"), and e2e
+ *  loop-test traffic (domains like "example-e2e.invalid"). Mirrors the
+ *  homepage's isRealDemand() filter AND the dashboard's dmSynthetic() so all
+ *  three surfaces agree on what counts as real demand. */
 function isSyntheticTraffic(domain: string | null): boolean {
   if (domain == null) return false;
   const d = domain.toLowerCase();
   return PLAYGROUND_DOMAINS.has(d) || d.includes(".invalid") || d.includes("example-e2e");
 }
 
+/** HISTORICAL-RESIDUE filter (deletable after 2026-08-09, when the 30-day event
+ *  TTL has aged out everything logged before probes self-identified): exact
+ *  normalized query strings our own tooling sent to /search BEFORE 2026-07-09
+ *  under the indistinguishable "web-playground" label — the smoke suite's 2
+ *  fixed probes, the golden retrieval set (eval/golden.json), the refusal set
+ *  (eval/refusal-set.json), and tools/gen-for-pages.mjs build-time queries.
+ *  Used ONLY to keep `playground_top_asks` honest; forward traffic is separated
+ *  by the `probe` domain label, not this list. */
+const PROBE_TASK_RESIDUE = new Set([
+  // smoke suite
+  "verify stripe webhook", "purple monkey dishwasher",
+  // eval/golden.json (20)
+  "verify that a stripe webhook payload is authentic",
+  "respond to slack url_verification challenge and validate event callbacks",
+  "force the openai api to return strictly valid json",
+  "supabase row level security policies with anon key vs service role key",
+  "design a dynamodb single table that avoids hot partitions",
+  "consume sqs messages reliably with a dead letter queue and visibility timeout",
+  "attach binary artifacts to a github release via the api",
+  "cut claude api spend by caching repeated prompt context",
+  "send a contract out for e-signature through docusign",
+  "deploy a worker to cloudflare with wrangler, a kv binding and secrets",
+  "keep google calendar in sync using sync tokens instead of refetching everything",
+  "capture a razorpay payment and verify the checkout signature",
+  "publish an npm package with provenance attestation and 2fa",
+  "open a pagerduty incident from code",
+  "create a customer invoice in quickbooks online through the api",
+  "build a docker image for both amd64 and arm64 and push it to docker hub",
+  "run an online alter table on a huge mysql table with no downtime",
+  "process sendgrid bounce and open webhook events",
+  "send outlook email programmatically with microsoft graph",
+  "discord bot posting messages without hitting rate limits",
+  // eval/refusal-set.json v3 (retrieval + garbage + compound)
+  "verify stripe webhook signature",
+  "send an email through the gmail api with oauth",
+  "upload a file to s3 from the browser with a presigned url",
+  "set up supabase row level security for multi-tenant data",
+  "consume a kafka topic and commit offsets safely",
+  "create a page in a notion database via api",
+  "create a jira issue with the rest api",
+  "send a push notification with fcm http v1 api",
+  "send a docusign envelope for e-signature",
+  "add a not null column to a large postgres table without downtime",
+  "post a message to slack from a bot",
+  "send an sms with twilio",
+  "open a github pull request via the api",
+  "create a product in shopify with the admin api",
+  "stream chat completions from the openai api",
+  "refresh an oauth2 access token correctly",
+  "upload an object to cloudflare r2",
+  "send transactional email with aws ses without spam",
+  "asdf qwerty zxcv random nonsense tokens here",
+  "the quick brown fox jumps over the lazy dog",
+  "webhook oauth kubernetes banana pipeline toaster deploy",
+  "serverless blockchain synergy endpoint flux capacitor agile",
+  "stripe glorble wumbo zizzle frap noodle",
+  "kafka blorptastic snigglewump vorpal grommet",
+  "refund a github pull request using twilio row level security",
+  "upload a jira ticket into my gmail webhook via kafka sms",
+  "der flauschige pinguin tanzt auf dem regenbogen heute",
+  "さーばー ばなな うちゅう たこやき でんしゃ",
+  "my grandmother's lasagna recipe with extra basil",
+  "best hiking trails near denver in october",
+  "send a slack message when a github pull request merges",
+  "send a twilio sms when a stripe payment fails",
+  "create a jira issue from a slack slash command",
+  // tools/gen-for-pages.mjs build-time queries
+  "send email gmail api", "google calendar create event", "book a meeting scheduling",
+  "slack post message", "hubspot create contact crm", "cold email sequence outreach",
+  "email deliverability spam", "salesforce api", "linkedin outreach",
+  "qualify inbound lead", "intercom send message", "twilio send sms",
+  "sync crm records", "verify webhook signature",
+]);
+
+/** Homepage demo-chip preset queries (waymark-site/index.html playDemo(...)).
+ *  A human clicking a preset chip is engagement, not organic demand content —
+ *  permanently excluded from `playground_top_asks` (unlike PROBE_TASK_RESIDUE,
+ *  this set does not expire). Keep in sync with the homepage chips. */
+const PLAYGROUND_PRESET_TASKS = new Set([
+  "verify stripe webhook signatures",
+  "consume sqs messages with a dead letter queue",
+  "send a contract for e-signature with docusign",
+]);
+
 interface DemandMetrics {
   window: string;
-  queries_total: number; queries_real: number; queries_playground: number;
+  queries_total: number; queries_real: number; queries_playground: number; queries_probe: number;
   queries_zero_result: number; zero_result_rate: number;
   attestations: number; attest_success: number; attest_failure: number; attest_rate_per_real_query: number;
   contributions_community: number; contributions_operator: number; distinct_contributors: number;
@@ -1277,6 +1383,10 @@ interface DemandMetrics {
   drift_alert_subscribers: number;
   zero_result_samples: { task: string; t: string }[];
   real_query_samples: { task: string; domain: string | null; t: string }[];
+  /** What human playground visitors actually typed (top repeated asks first) —
+   *  excludes self-labeled probes, known pre-2026-07-09 probe residue, and the
+   *  homepage demo-chip presets. */
+  playground_top_asks: { task: string; n: number; last: string }[];
 }
 
 /** Counts of paid route requests ($25 bounty intake, v0.7) by status. Counts
@@ -1303,16 +1413,31 @@ async function routeRequestCounts(env: Env): Promise<{ total: number; open: numb
 
 async function demandMetrics(env: Env): Promise<DemandMetrics> {
   const events = await loadRecentEvents(env, 1000);
-  let qReal = 0, qPlayground = 0, qZero = 0, attestS = 0, attestF = 0, contribCommunity = 0, contribOperator = 0;
+  let qReal = 0, qPlayground = 0, qProbe = 0, qZero = 0, attestS = 0, attestF = 0, contribCommunity = 0, contribOperator = 0;
   const zeroSamples: { task: string; t: string }[] = [];
   const realSamples: { task: string; domain: string | null; t: string }[] = [];
+  const playgroundAsks = new Map<string, { task: string; n: number; last: string }>();
   const contributors = new Set<string>();
   for (const e of events) {
     const d = e.detail as Record<string, unknown>;
     if (e.type === "query") {
       const domain = d.domain != null ? String(d.domain) : null;
       if (isSyntheticTraffic(domain)) {
-        qPlayground++;
+        if (domain?.toLowerCase() === "probe") {
+          qProbe++; // self-labeled smoke/eval/build traffic — never demand
+        } else {
+          qPlayground++;
+          // Aggregate what human visitors typed into the homepage playground —
+          // the richest organic-demand signal we collect (e.g. HN-launch
+          // traffic). Excludes known probe residue + demo-chip presets.
+          const task = String(d.task ?? "").trim();
+          const norm = task.toLowerCase();
+          if (task && !PROBE_TASK_RESIDUE.has(norm) && !PLAYGROUND_PRESET_TASKS.has(norm)) {
+            const cur = playgroundAsks.get(norm);
+            if (cur) { cur.n++; if (e.t > cur.last) cur.last = e.t; }
+            else playgroundAsks.set(norm, { task, n: 1, last: e.t });
+          }
+        }
       } else {
         qReal++;
         if (realSamples.length < 12) realSamples.push({ task: String(d.task ?? ""), domain, t: e.t });
@@ -1330,14 +1455,17 @@ async function demandMetrics(env: Env): Promise<DemandMetrics> {
       if (d.contributor) contributors.add(String(d.contributor));
     }
   }
-  const totalQ = qReal + qPlayground;
+  const topAsks = [...playgroundAsks.values()]
+    .sort((a, b) => b.n - a.n || (a.last < b.last ? 1 : -1))
+    .slice(0, 12);
+  const totalQ = qReal + qPlayground + qProbe;
   const attestTotal = attestS + attestF;
   const keysIssued = parseInt((await env.ROUTES.get("counter:keys")) ?? "0", 10);
   const rr = await routeRequestCounts(env);
   const driftAlerts = await driftAlertCount(env);
   return {
     window: "last ≤1000 events (30-day retention)",
-    queries_total: totalQ, queries_real: qReal, queries_playground: qPlayground,
+    queries_total: totalQ, queries_real: qReal, queries_playground: qPlayground, queries_probe: qProbe,
     queries_zero_result: qZero, zero_result_rate: qReal ? +(qZero / qReal).toFixed(3) : 0,
     attestations: attestTotal, attest_success: attestS, attest_failure: attestF,
     attest_rate_per_real_query: qReal ? +(attestTotal / qReal).toFixed(3) : 0,
@@ -1346,6 +1474,7 @@ async function demandMetrics(env: Env): Promise<DemandMetrics> {
     route_requests_total: rr.total, route_requests_open: rr.open, route_requests_fulfilled: rr.fulfilled,
     drift_alert_subscribers: driftAlerts,
     zero_result_samples: zeroSamples, real_query_samples: realSamples,
+    playground_top_asks: topAsks,
   };
 }
 
@@ -1369,6 +1498,9 @@ function renderDemandPage(m: DemandMetrics): string {
   const real = m.real_query_samples.length
     ? m.real_query_samples.map((r) => `<li><span class="q">${esc2(r.task)}</span><span class="dm">${esc2(r.domain ?? "—")}</span></li>`).join("")
     : `<li class="none">No non-playground queries yet. Every query so far is homepage demo traffic — distribution is the bottleneck, not routes.</li>`;
+  const asks = m.playground_top_asks.length
+    ? m.playground_top_asks.map((a) => `<li><span class="q">${esc2(a.task)}</span><span class="t">${a.n > 1 ? `${a.n}× · ` : ""}${esc2(a.last.slice(0, 16).replace("T", " "))}</span></li>`).join("")
+    : `<li class="none">No human playground queries in the window yet.</li>`;
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Demand — real agent usage | Waymark</title>
 <meta name="robots" content="noindex">
@@ -1402,7 +1534,8 @@ footer{color:#5b6880;font-size:12.5px;margin-top:34px}</style></head><body>
 <p class="win">Window: ${esc2(m.window)}</p>
 <div class="grid">
 ${card("Real agent queries", m.queries_real, "excludes playground + test traffic")}
-${card("Playground / test", m.queries_playground, "homepage demo + smoke/e2e probes")}
+${card("Playground (human)", m.queries_playground, "homepage visitors; pre-2026-07-09 events include unlabeled probe residue")}
+${card("Self-labeled probes", m.queries_probe, "our smoke/eval/build traffic (?probe=1)")}
 ${card("Zero-result", `${m.queries_zero_result}`, `${(m.zero_result_rate * 100).toFixed(1)}% of real queries`)}
 </div>
 <div class="grid">
@@ -1416,6 +1549,8 @@ ${card("Drift-alert signups", m.drift_alert_subscribers, "email capture on /drif
 <ul>${zero}</ul>
 <h2>Real agent queries (non-playground)</h2>
 <ul>${real}</ul>
+<h2>What playground visitors asked (typed, organic — demo chips + known probe strings excluded)</h2>
+<ul>${asks}</ul>
 <div class="note"><b>Read this as:</b> if real agent queries and attestation rate are near zero while route count climbs, the bottleneck is distribution and the contribution loop — not the map. Grow these, not the counter.</div>
 <footer>Waymark — a service of MC Software, LLC · <a href="/demand.json">JSON feed</a> · internal metrics</footer>
 </body></html>`;
@@ -1562,7 +1697,10 @@ export default {
     }
     if (pathname === "/search") {
       const q = searchParams.get("q") ?? "";
-      return withServiceDesc(searchEndpoint(env, q, ctx));
+      // probe=1: our own smoke/eval/build tooling self-identifies so demand
+      // telemetry can separate human playground queries from our probes.
+      const isProbe = searchParams.get("probe") === "1";
+      return withServiceDesc(searchEndpoint(env, q, ctx, isProbe));
     }
     if (pathname === "/admin/merge-index" && request.method === "POST") {
       return mergeIndex(env, request.headers.get("x-write-key"), request);
@@ -2122,8 +2260,11 @@ async function activityEndpoint(env: Env, limit: number): Promise<Response> {
   return Response.json({ events }, { headers: { ...CORS, "Cache-Control": "public, max-age=15" } });
 }
 
-/** Public JSON search over the route map (powers the site playground). */
-async function searchEndpoint(env: Env, q: string, ctx: ExecutionContext): Promise<Response> {
+/** Public JSON search over the route map (powers the site playground).
+ *  isProbe: caller self-identified as our own tooling via ?probe=1 — the query
+ *  event is logged under domain "probe" (still written, so the smoke suite's
+ *  telemetry-liveness criterion keeps working) instead of "web-playground". */
+async function searchEndpoint(env: Env, q: string, ctx: ExecutionContext, isProbe = false): Promise<Response> {
   if (!q.trim()) return Response.json({ routes: [] }, { headers: CORS });
   // Cache the *billed Vectorize retrieval result* (not the whole response) keyed
   // by the normalized query, so repeated identical /search queries — crawlers,
@@ -2162,7 +2303,7 @@ async function searchEndpoint(env: Env, q: string, ctx: ExecutionContext): Promi
     // caches.default actually retains it; key is never dispatched, only matched.
     ctx.waitUntil(cache.put(cacheKey, Response.json(ranked, { headers: { "Cache-Control": "public, max-age=60" } })));
   }
-  ctx.waitUntil(logEvent(env, "query", { task: q.slice(0, 140), domain: "web-playground", results: ranked.length, ms: retrievalMs }));
+  ctx.waitUntil(logEvent(env, "query", { task: q.slice(0, 140), domain: isProbe ? "probe" : "web-playground", results: ranked.length, ms: retrievalMs }));
   return Response.json({ routes: ranked }, { headers: { ...CORS, "Cache-Control": "public, max-age=60", "X-Search-Cache": retrievalMs < 0 ? "hit" : "miss" } });
 }
 
@@ -2662,6 +2803,7 @@ function openApiSpec(env: Env) {
             "with a confidence floor (returns an empty list rather than a low-confidence wrong route).",
           parameters: [
             { name: "q", in: "query", required: true, description: "Natural-language task description.", schema: { type: "string", maxLength: 256 } },
+            { name: "probe", in: "query", required: false, description: "Set to `1` only by Waymark's own smoke/eval/build tooling so demand telemetry can separate internal probes from organic queries. Omit for normal use.", schema: { type: "string", enum: ["1"] } },
           ],
           responses: {
             "200": {
@@ -3220,7 +3362,7 @@ function load(){
        source guarantees BOTH the domain map and the zero-result list below exclude
        synthetic traffic — so the dashboard can no longer show "purple monkey
        dishwasher" as a coverage gap (the pollution item 11 removed from /demand). */
-    function dmSynthetic(domain){if(domain==null)return false;var d=String(domain).toLowerCase();return d==="web-playground"||d==="playground"||d.indexOf(".invalid")>=0||d.indexOf("example-e2e")>=0;}
+    function dmSynthetic(domain){if(domain==null)return false;var d=String(domain).toLowerCase();return d==="web-playground"||d==="playground"||d==="probe"||d.indexOf(".invalid")>=0||d.indexOf("example-e2e")>=0;}
     var qevents=a.events.filter(function(e){return e.type==="query"&&e.detail&&!dmSynthetic(e.detail.domain)});
     var dcounts={};
     qevents.forEach(function(e){var d=e.detail.domain;if(d)dcounts[d]=(dcounts[d]||0)+1});
