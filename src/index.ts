@@ -1425,8 +1425,17 @@ async function routeRequestCounts(env: Env): Promise<{ total: number; open: numb
   }
 }
 
+/** Event window for demand metrics. Was 1000 — which put a cold /demand render
+ *  AT the Workers per-request subrequest cap (~1000): 1000 KV gets + N evt: list
+ *  pages + counter:keys + rr: list/gets + da: list ≈ 1006+ subrequests, i.e. one
+ *  growth spurt away from hard 500s (observed live 2026-07-09: events_30d=1069,
+ *  3.3–5.1s TTFB, zero headroom). 900 leaves ~100 subrequests of headroom for
+ *  list-page growth (item 62 covers the real fix at ~10k events: reverse-sortable
+ *  keys → single-page reads). Keep the public `window` label in sync. */
+const DEMAND_EVENT_WINDOW = 900;
+
 async function demandMetrics(env: Env): Promise<DemandMetrics> {
-  const events = await loadRecentEvents(env, 1000);
+  const events = await loadRecentEvents(env, DEMAND_EVENT_WINDOW);
   let qReal = 0, qPlayground = 0, qProbe = 0, qZero = 0, attestS = 0, attestF = 0, contribCommunity = 0, contribOperator = 0;
   const zeroSamples: { task: string; t: string }[] = [];
   const realSamples: { task: string; domain: string | null; t: string }[] = [];
@@ -1478,7 +1487,7 @@ async function demandMetrics(env: Env): Promise<DemandMetrics> {
   const rr = await routeRequestCounts(env);
   const driftAlerts = await driftAlertCount(env);
   return {
-    window: "last ≤1000 events (30-day retention)",
+    window: `last ≤${DEMAND_EVENT_WINDOW} events (30-day retention)`,
     queries_total: totalQ, queries_real: qReal, queries_playground: qPlayground, queries_probe: qProbe,
     queries_zero_result: qZero, zero_result_rate: qReal ? +(qZero / qReal).toFixed(3) : 0,
     attestations: attestTotal, attest_success: attestS, attest_failure: attestF,
@@ -1611,13 +1620,24 @@ export default {
     // each page already promises. Bare /routes is deliberately excluded — it
     // content-negotiates (Vary: Accept), so a URL-only key could serve the HTML
     // representation to a JSON consumer.
+    //
+    // [item 66, 2026-07-09] /demand + /demand.json added: demandMetrics() is the
+    // single most expensive render in the worker (~900 KV gets for the event
+    // window + rr:/da: scans), measured 3.3–5.1s TTFB on EVERY hit because these
+    // two paths were never in this allowlist — their Cache-Control max-age=60
+    // only governed browsers, not the POP. Both are pure functions of the URL
+    // (no auth/negotiation; /demand.json is a separate path, not Accept-varied),
+    // so the URL is a complete cache key. /demand.json is the one non-HTML
+    // member of the allowlist — see the JSON carve-out at the cache.put below.
     const url = new URL(request.url);
     const p = url.pathname;
     const cacheable = request.method === "GET" && (
       (p.startsWith("/r/") && !p.endsWith(".json")) ||  // /r/{id} route pages
       p.startsWith("/routes/") ||                        // /routes/{slug} per-domain dirs (HTML-only)
       p === "/contributors" ||                           // leaderboard (/contributors.json is separate)
-      p === "/drift"                                     // drift tracker (/drift.json is separate)
+      p === "/drift" ||                                  // drift tracker (/drift.json is separate)
+      p === "/demand" ||                                 // demand dashboard (60s TTL via its max-age)
+      p === "/demand.json"                               // demand feed (JSON; same 60s TTL)
     );
     // `caches.default` is a Cloudflare global (the DOM CacheStorage lib that
     // leaks into this build doesn't type it) — cast precisely, no `any`.
@@ -1641,12 +1661,14 @@ export default {
       res.headers.set("Permissions-Policy", "geolocation=(), microphone=(), camera=()");
     }
 
-    // Populate the edge cache only for a successful (200) HTML response. The
+    // Populate the edge cache only for a successful (200) response. The
     // not-found paths (unknown /r/{id} id, empty/unmatched /routes/{slug}) are
     // status-404 and intentionally not cached, so a route/domain that appears
     // later isn't masked by a cached miss. Cache the post-header-injection
-    // response so cache hits carry CSP/nosniff/etc.
-    if (cacheable && res.status === 200 && ct.includes("text/html")) {
+    // response so cache hits carry CSP/nosniff/etc. /demand.json is the single
+    // allowlisted JSON surface (item 66) — matched by exact path, so this
+    // carve-out cannot accidentally admit other JSON endpoints.
+    if (cacheable && res.status === 200 && (ct.includes("text/html") || p === "/demand.json")) {
       ctx.waitUntil(cache.put(request, res.clone()));
     }
     return res;
