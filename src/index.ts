@@ -1678,6 +1678,19 @@ export default {
   },
   dispatch(request: Request, env: Env, ctx: ExecutionContext): Response | Promise<Response> {
     const { pathname, searchParams } = new URL(request.url);
+    // Canonical trailing-slash redirect: GET/HEAD requests to a path ending in
+    // "/" (other than root) 301 to the slash-stripped path, preserving the
+    // query string. Kills duplicate-content URLs and the confusing "/routes/"
+    // 404 (startsWith("/routes/") matched an empty domain slug). POST/etc. and
+    // "/" are untouched so /mcp and auth flows can't be affected.
+    if ((request.method === "GET" || request.method === "HEAD") && pathname.length > 1 && pathname.endsWith("/")) {
+      const stripped = pathname.replace(/\/+$/, "") || "/";
+      if (stripped !== pathname) {
+        const url = new URL(request.url);
+        url.pathname = stripped;
+        return new Response(null, { status: 301, headers: { "Location": url.toString() } });
+      }
+    }
     // CORS preflight: answer OPTIONS centrally with 204 so NO downstream handler
     // runs. Previously OPTIONS had no special case, so a browser preflight to
     // /search executed a real Vectorize retrieve() + logged a phantom
