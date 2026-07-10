@@ -1527,6 +1527,9 @@ function renderDemandPage(m: DemandMetrics): string {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Demand — real agent usage | Waymark</title>
 <meta name="robots" content="noindex">
+<link rel="icon" type="image/png" sizes="32x32" href="https://waymark.network/favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="https://waymark.network/favicon-16.png">
+<link rel="apple-touch-icon" href="https://waymark.network/apple-touch-icon.png">
 <style>:root{--bg:#0b0e14;--panel:#131826;--line:#1f2840;--text:#e6ebf4;--dim:#8b96ad;--teal:#5eead4;--indigo:#818cf8;--gold:#fbbf24;--bad:#f87171;--good:#34d399}
 *{box-sizing:border-box;margin:0}body{background:var(--bg);color:var(--text);font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:920px;margin:0 auto;padding:0 24px 70px}
 a{color:var(--teal);text-decoration:none}a:hover{text-decoration:underline}
@@ -1592,7 +1595,7 @@ const HTML_CSP =
   "object-src 'none'; " +
   "frame-ancestors 'none'; " +
   "form-action 'self'; " +
-  "img-src 'self' data:; " +
+  "img-src 'self' data: https://waymark.network; " +
   "script-src 'self' 'unsafe-inline'; " +
   "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
   "font-src 'self' https://fonts.gstatic.com data:; " +
@@ -1703,6 +1706,14 @@ export default {
       return Response.json(serverCard(env));
     }
     if (pathname === "/health") return new Response("ok");
+    // Item 77: worker-served HTML surfaces have no favicon; redirect to the
+    // Pages site's icon set (waymark.network serves favicon.ico/32/16/apple-touch).
+    if (pathname === "/favicon.ico") {
+      return new Response(null, {
+        status: 302,
+        headers: { "Location": "https://waymark.network/favicon.ico", "Cache-Control": "public, max-age=86400" },
+      });
+    }
     if (pathname === "/stats") return withServiceDesc(stats(request, env));
     if (pathname === "/routes") {
       // Browsers get the server-rendered browse page; programmatic consumers
@@ -1826,7 +1837,7 @@ function notFound(request: Request, pathname: string): Response {
   }
   const p = escapeHtml(pathname);
   return new Response(
-    `<!doctype html><meta charset="utf-8"><title>Not found — Waymark</title><meta name="robots" content="noindex"><body style="background:#0b0e14;color:#e6ebf4;font:16px/1.6 -apple-system,BlinkMacSystemFont,sans-serif;max-width:640px;margin:60px auto;padding:24px"><h1 style="font-size:22px">404 — not found</h1><p style="color:#8b96ad">No Waymark endpoint at <code>${p}</code>.</p><p style="color:#8b96ad">Try the <a style="color:#5eead4" href="/dashboard">live dashboard</a>, the <a style="color:#5eead4" href="/routes">route directory</a>, or <a style="color:#5eead4" href="https://waymark.network">waymark.network</a>.</p></body>`,
+    `<!doctype html><meta charset="utf-8"><title>Not found — Waymark</title><meta name="robots" content="noindex"><link rel="icon" type="image/png" sizes="32x32" href="https://waymark.network/favicon-32.png"><link rel="icon" type="image/png" sizes="16x16" href="https://waymark.network/favicon-16.png"><link rel="apple-touch-icon" href="https://waymark.network/apple-touch-icon.png"><body style="background:#0b0e14;color:#e6ebf4;font:16px/1.6 -apple-system,BlinkMacSystemFont,sans-serif;max-width:640px;margin:60px auto;padding:24px"><h1 style="font-size:22px">404 — not found</h1><p style="color:#8b96ad">No Waymark endpoint at <code>${p}</code>.</p><p style="color:#8b96ad">Try the <a style="color:#5eead4" href="/dashboard">live dashboard</a>, the <a style="color:#5eead4" href="/routes">route directory</a>, or <a style="color:#5eead4" href="https://waymark.network">waymark.network</a>.</p></body>`,
     { status: 404, headers: { "Content-Type": "text/html;charset=utf-8", "Cache-Control": "no-store" } },
   );
 }
@@ -1998,6 +2009,9 @@ function driftPage(events: DriftEvent[]): string {
 <link rel="canonical" href="https://mcp.waymark.network/drift">
 <link rel="alternate" type="application/rss+xml" title="Waymark API Drift Tracker" href="https://mcp.waymark.network/drift.xml">
 <link rel="alternate" type="application/json" title="Waymark API Drift Tracker (JSON)" href="https://mcp.waymark.network/drift.json">
+<link rel="icon" type="image/png" sizes="32x32" href="https://waymark.network/favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="https://waymark.network/favicon-16.png">
+<link rel="apple-touch-icon" href="https://waymark.network/apple-touch-icon.png">
 <style>:root{--bg:#0b0e14;--panel:#131826;--line:#1f2840;--text:#e6ebf4;--dim:#8b96ad;--teal:#5eead4;--indigo:#818cf8;--gold:#fbbf24;--bad:#f87171;--good:#34d399}
 *{box-sizing:border-box;margin:0}body{background:var(--bg);color:var(--text);font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:820px;margin:0 auto;padding:0 24px 70px}
 a{color:var(--teal);text-decoration:none}a:hover{text-decoration:underline}
@@ -2149,6 +2163,9 @@ function contributorsPage(data: ContributorStat[]): string {
 <meta name="twitter:image:alt" content="waymark — the collective intelligence network for AI agents">
 <link rel="canonical" href="https://mcp.waymark.network/contributors">
 <link rel="alternate" type="application/json" title="Waymark contributors (JSON)" href="https://mcp.waymark.network/contributors.json">
+<link rel="icon" type="image/png" sizes="32x32" href="https://waymark.network/favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="https://waymark.network/favicon-16.png">
+<link rel="apple-touch-icon" href="https://waymark.network/apple-touch-icon.png">
 <style>:root{--bg:#0b0e14;--panel:#131826;--line:#1f2840;--text:#e6ebf4;--dim:#8b96ad;--teal:#5eead4;--indigo:#818cf8;--gold:#fbbf24;--bad:#f87171;--good:#34d399}
 *{box-sizing:border-box;margin:0}body{background:var(--bg);color:var(--text);font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:900px;margin:0 auto;padding:0 24px 70px}
 a{color:var(--teal);text-decoration:none}a:hover{text-decoration:underline}
@@ -2391,6 +2408,9 @@ async function routesBrowsePage(env: Env): Promise<Response> {
 <meta name="twitter:image:alt" content="waymark — the collective intelligence network for AI agents">
 <meta name="twitter:title" content="Browse ${idx.length} agent routes — Waymark">
 <meta name="twitter:description" content="${escapeHtml(desc)}">
+<link rel="icon" type="image/png" sizes="32x32" href="https://waymark.network/favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="https://waymark.network/favicon-16.png">
+<link rel="apple-touch-icon" href="https://waymark.network/apple-touch-icon.png">
 <script type="application/ld+json">${jsonLdSafe(breadcrumbLd)}</script>
 <style>:root{--bg:#0b0e14;--panel:#131826;--line:#1f2840;--text:#e6ebf4;--dim:#8b96ad;--accent:#5eead4;--warn:#fbbf24;--good:#34d399}
 *{box-sizing:border-box;margin:0}body{background:var(--bg);color:var(--text);font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:860px;margin:0 auto;padding:24px}
@@ -2444,7 +2464,7 @@ async function routeDomainPage(env: Env, slugRaw: string): Promise<Response> {
   }
   if (matched.size === 0) {
     return new Response(
-      `<!doctype html><meta charset="utf-8"><title>Domain not found — Waymark</title><meta name="robots" content="noindex"><body style="background:#0b0e14;color:#e6ebf4;font:16px/1.6 -apple-system,sans-serif;max-width:640px;margin:60px auto;padding:24px"><h1 style="font-size:22px">No routes for that domain</h1><p style="color:#8b96ad">Nothing in the route map matches <code>${escapeHtml(slug)}</code>. <a style="color:#5eead4" href="/routes">Browse all domains</a>.</p></body>`,
+      `<!doctype html><meta charset="utf-8"><title>Domain not found — Waymark</title><meta name="robots" content="noindex"><link rel="icon" type="image/png" sizes="32x32" href="https://waymark.network/favicon-32.png"><link rel="icon" type="image/png" sizes="16x16" href="https://waymark.network/favicon-16.png"><link rel="apple-touch-icon" href="https://waymark.network/apple-touch-icon.png"><body style="background:#0b0e14;color:#e6ebf4;font:16px/1.6 -apple-system,sans-serif;max-width:640px;margin:60px auto;padding:24px"><h1 style="font-size:22px">No routes for that domain</h1><p style="color:#8b96ad">Nothing in the route map matches <code>${escapeHtml(slug)}</code>. <a style="color:#5eead4" href="/routes">Browse all domains</a>.</p></body>`,
       { status: 404, headers: { "Content-Type": "text/html;charset=utf-8" } });
   }
   const domainNames = [...matched.keys()].sort();
@@ -2499,6 +2519,9 @@ async function routeDomainPage(env: Env, slugRaw: string): Promise<Response> {
 <meta name="twitter:image:alt" content="waymark — the collective intelligence network for AI agents">
 <meta name="twitter:title" content="${t} — agent routes | Waymark">
 <meta name="twitter:description" content="${escapeHtml(desc)}">
+<link rel="icon" type="image/png" sizes="32x32" href="https://waymark.network/favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="https://waymark.network/favicon-16.png">
+<link rel="apple-touch-icon" href="https://waymark.network/apple-touch-icon.png">
 <script type="application/ld+json">${jsonLdSafe(breadcrumbLd)}</script>
 <style>:root{--bg:#0b0e14;--panel:#131826;--line:#1f2840;--text:#e6ebf4;--dim:#8b96ad;--accent:#5eead4;--warn:#fbbf24;--good:#34d399}
 *{box-sizing:border-box;margin:0}body{background:var(--bg);color:var(--text);font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:860px;margin:0 auto;padding:24px}
@@ -2700,6 +2723,9 @@ ${isSyntheticTraffic(r.domain) ? `<meta name="robots" content="noindex">\n` : ""
 <meta name="twitter:image:alt" content="waymark — the collective intelligence network for AI agents">
 <meta name="twitter:title" content="${t} — ${titleKind} | Waymark">
 <meta name="twitter:description" content="${desc}">
+<link rel="icon" type="image/png" sizes="32x32" href="https://waymark.network/favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="https://waymark.network/favicon-16.png">
+<link rel="apple-touch-icon" href="https://waymark.network/apple-touch-icon.png">
 <script type="application/ld+json">${jsonLdSafe(jsonLd)}</script>
 <script type="application/ld+json">${jsonLdSafe(breadcrumbLd)}</script>
 <style>:root{--bg:#0b0e14;--panel:#131826;--line:#1f2840;--text:#e6ebf4;--dim:#8b96ad;--accent:#5eead4;--warn:#fbbf24;--good:#34d399}
@@ -2979,6 +3005,9 @@ const DASHBOARD_HTML = `<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Waymark — Live Network</title>
 <meta name="description" content="Real-time telemetry of the Waymark agent knowledge network: routes, queries, attestations, trust.">
+<link rel="icon" type="image/png" sizes="32x32" href="https://waymark.network/favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="https://waymark.network/favicon-16.png">
+<link rel="apple-touch-icon" href="https://waymark.network/apple-touch-icon.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <style>
