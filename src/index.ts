@@ -525,6 +525,14 @@ async function migrateVerification(env: Env, key: string | null, request: Reques
   });
 }
 
+/* Point-of-intent conversion line (revenue backlog R1, 2026-07-10): shown ONLY
+ * on zero-result / refused responses — the moment the caller has told us exactly
+ * which route is missing. One tasteful line, never attached to successful
+ * results (route data unchanged). Shared by waymark_query and /search. */
+const NO_RESULT_CTA =
+  "No verified route for this yet — request one authored + verified for your stack in 24h: " +
+  "https://waymark.network/pricing (custom route, $25).";
+
 export class WaymarkMCP extends McpAgent<Env> {
   server = new McpServer({ name: "waymark", version: "0.2.0" });
 
@@ -554,10 +562,26 @@ export class WaymarkMCP extends McpAgent<Env> {
           probe: z.boolean().optional().describe(
             "Set true only by Waymark's own smoke/eval/benchmark tooling so demand telemetry can separate internal probes from real agent queries"
           ),
+          // R0 (metered Pro): verified-only retrieval. Normal queries stay free
+          // and keyless — these two fields are only for the Pro premium mode.
+          verified_only: z.boolean().optional().describe(
+            "Pro: return only individually fact-checked (verification:'verified') routes. Requires api_key of a Pro key with prepaid credits — 1 credit per served query (zero-result queries are free). Omit for normal free queries."
+          ),
+          api_key: z.string().max(200).optional().describe(
+            "Contributor API key (wmk_…) — only needed with verified_only. Get Pro at https://waymark.network/pricing"
+          ),
         },
         annotations: { readOnlyHint: true, openWorldHint: false },
       },
-      async ({ task, domain, limit, probe }) => {
+      async ({ task, domain, limit, probe, verified_only, api_key }) => {
+        // R0 entitlement gate — checked before any billed retrieval runs.
+        let proKey: { rec: ContribKey; storeKey: string } | null = null;
+        if (verified_only) {
+          proKey = await proKeyWithCredits(env, api_key ?? null);
+          if (!proKey) {
+            return { content: [{ type: "text" as const, text: JSON.stringify({ status: 402, ...PRO_UPSELL }) }], isError: true };
+          }
+        }
         // Best-effort query counter (KV is not atomic; fine for alpha stats).
         // Kicked off here so it overlaps retrieval, but MUST be awaited before
         // returning — un-awaited writes get cancelled (see logEvent docs).
@@ -565,7 +589,11 @@ export class WaymarkMCP extends McpAgent<Env> {
           env.ROUTES.put("counter:queries", String(parseInt(v ?? "0", 10) + 1))
         ).catch(() => {});
         const t0 = Date.now();
-        const routes = await retrieve(env, task, domain, limit);
+        const routes = verified_only
+          ? (await retrieve(env, task, domain, Math.max(limit * 3, 15)))
+              .filter((r) => (r.verification?.status ?? "sampled") === "verified")
+              .slice(0, limit)
+          : await retrieve(env, task, domain, limit);
         const retrievalMs = Date.now() - t0;
         const ranked = routes.map((r) => ({
             route_id: r.id,
@@ -580,6 +608,11 @@ export class WaymarkMCP extends McpAgent<Env> {
             attestation_count: r.attestations.success + r.attestations.failure,
             verification: r.verification ?? { status: "sampled", method: "legacy-file-sample" },
           }));
+        // R0: 1 credit per SERVED verified-only query (zero-result = no charge).
+        let creditsRemaining: number | null = null;
+        if (proKey) {
+          creditsRemaining = ranked.length > 0 ? await consumeCredit(env, proKey) : (proKey.rec.credits ?? 0);
+        }
         await Promise.all([
           counterWrite,
           logEvent(env, "query", {
@@ -591,6 +624,7 @@ export class WaymarkMCP extends McpAgent<Env> {
             domain: probe ? "probe" : (domain ?? null),
             results: ranked.length,
             ms: retrievalMs,
+            ...(verified_only ? { verified_only: true } : {}),
           }),
         ]);
         return {
@@ -599,13 +633,18 @@ export class WaymarkMCP extends McpAgent<Env> {
               type: "text" as const,
               text:
                 ranked.length > 0
-                  ? JSON.stringify({ routes: ranked, note: "After completing the task, call waymark_attest with the route_id and outcome." }, null, 2)
+                  ? JSON.stringify({
+                      routes: ranked,
+                      ...(proKey ? { verified_only: true, credits_remaining: creditsRemaining } : {}),
+                      note: "After completing the task, call waymark_attest with the route_id and outcome.",
+                    }, null, 2)
                   : JSON.stringify({
                       routes: [],
                       note: "No routes yet for this task. After you complete it, call waymark_contribute so the next agent doesn't start from zero.",
-                      // Moment-of-intent conversion (revenue backlog #2): the agent's
-                      // operator is the buyer; agents relay this verbatim when the
-                      // missing route blocked or slowed the task.
+                      // Moment-of-intent conversion (revenue backlog #2 + R1): the
+                      // agent's operator is the buyer; agents relay this verbatim
+                      // when the missing route blocked or slowed the task.
+                      no_result_cta: NO_RESULT_CTA,
                       request_route: {
                         what: "If this task matters to your operator, a human can commission a fact-checked route for it ($25 bounty).",
                         price_usd: 25,
@@ -998,8 +1037,12 @@ const KEY_ISSUE_GLOBAL_HOURLY_CAP = 50;
 /** Reserved handles an external key may not claim (anti-impersonation, review #8). */
 const RESERVED_HANDLE = /(^|[^a-z])(waymark|operator|official|admin|staff|mc[\s_-]?software)([^a-z]|$)|seed/i;
 
-/** `tier` absent ⇒ "free" (back-compat: all pre-M1 records). */
-interface ContribKey { handle: string; created: string; revoked: boolean; contributions: number; lastAt: string | null; tier?: "free" | "pro" }
+/** `tier` absent ⇒ "free" (back-compat: all pre-M1 records).
+ * R0 (2026-07-10, metered Pro via prepaid credits): `credits` (absent ⇒ 0) is a
+ * prepaid balance topped up by the operator after Stripe payment
+ * (POST /admin/grant-credits); `queries_used` counts verified-only queries
+ * actually served (1 credit each). Free reads stay keyless and unmetered. */
+interface ContribKey { handle: string; created: string; revoked: boolean; contributions: number; lastAt: string | null; tier?: "free" | "pro"; credits?: number; queries_used?: number }
 
 /** Effective per-key hourly contribute cap for a key record (M1 entitlement). */
 function contribCapFor(rec: ContribKey): number {
@@ -1095,6 +1138,98 @@ async function revokeKey(env: Env, adminKey: string | null, request: Request): P
   rec.revoked = true;
   await env.ROUTES.put(storeKey, JSON.stringify(rec));
   return Response.json({ revoked: true, handle: rec.handle });
+}
+
+/* ---------------- R0 — metered Pro via prepaid credits (2026-07-10) --------
+ * The premium being metered is VERIFIED-ONLY RETRIEVAL: `verified_only=true`
+ * on /search or waymark_query returns only verification:"verified" routes,
+ * costs 1 prepaid credit per SERVED query (zero-result queries are free), and
+ * requires a Pro-tier key with credits>0. Normal queries are untouched — free,
+ * keyless, unmetered (the growth engine stays free). No payment logic
+ * in-worker: the operator tops up credits after Stripe payment. */
+
+/** 402-style upsell body when verified_only is requested without entitlement. */
+const PRO_UPSELL = {
+  error: "pro_required",
+  detail: "verified_only=true is a Pro feature metered by prepaid credits (1 credit per served query). Normal queries stay free and keyless — retry without verified_only.",
+  how: "Get Pro ($19/mo + usage) at https://waymark.network/pricing — after payment your contributor key is upgraded and topped up with credits. Check your balance any time at GET /v1/usage.",
+  pricing: "https://waymark.network/pricing",
+  checkout: "https://buy.stripe.com/cNi28r1kW1TR9iN5Seao80g",
+} as const;
+
+/** Contributor key from Authorization: Bearer … or x-api-key header. */
+function bearerKey(request: Request): string | null {
+  const auth = request.headers.get("authorization") ?? "";
+  if (/^bearer\s+/i.test(auth)) return auth.replace(/^bearer\s+/i, "").trim();
+  return request.headers.get("x-api-key");
+}
+
+/** Entitlement gate for verified-only retrieval: valid, unrevoked, Pro, credits>0. */
+async function proKeyWithCredits(env: Env, rawKey: string | null): Promise<{ rec: ContribKey; storeKey: string } | null> {
+  if (!rawKey) return null;
+  const k = await lookupContribKey(env, rawKey);
+  if (!k || k.rec.revoked || k.rec.tier !== "pro" || (k.rec.credits ?? 0) <= 0) return null;
+  return k;
+}
+
+/** Consume 1 credit for a SERVED verified-only query. KV get→put is non-atomic —
+ * same accepted alpha trade-off as every counter here (metering, not billing).
+ * Returns the remaining balance. */
+async function consumeCredit(env: Env, k: { rec: ContribKey; storeKey: string }): Promise<number> {
+  k.rec.credits = Math.max(0, (k.rec.credits ?? 0) - 1);
+  k.rec.queries_used = (k.rec.queries_used ?? 0) + 1;
+  await env.ROUTES.put(k.storeKey, JSON.stringify(k.rec));
+  return k.rec.credits;
+}
+
+/** POST /admin/grant-credits {key|key_hash|handle, credits, tier?} — WRITE_KEY-gated (R0).
+ * Operator/desk tops up a key's prepaid balance after a Stripe payment (Pro
+ * $19/mo monthly grant or a one-time credit block). `credits` ADDS to the
+ * existing balance (integer ≥0 — 0 is legal to only flip tier); `tier`
+ * optionally sets free|pro (same semantics as /admin/upgrade-key). */
+async function grantCredits(env: Env, adminKey: string | null, request: Request): Promise<Response> {
+  if (adminKey !== env.WRITE_KEY) return new Response("forbidden", { status: 403 });
+  let body: { key?: string; key_hash?: string; handle?: string; credits?: unknown; tier?: string };
+  try { body = await request.json(); } catch { return Response.json({ error: "bad json" }, { status: 400 }); }
+  const credits = Number(body.credits);
+  if (!Number.isInteger(credits) || credits < 0 || credits > 1_000_000) {
+    return Response.json({ error: "credits required: integer 0–1000000 (added to the existing balance)" }, { status: 400 });
+  }
+  if (body.tier !== undefined && body.tier !== "free" && body.tier !== "pro") {
+    return Response.json({ error: 'tier, if given, must be "free" | "pro"' }, { status: 400 });
+  }
+  let storeKey: string | null = null;
+  if (body.key) { const r = await lookupContribKey(env, body.key); storeKey = r?.storeKey ?? null; }
+  else if (body.key_hash && /^[0-9a-f]{64}$/.test(body.key_hash)) storeKey = `ck:${body.key_hash}`;
+  else if (body.handle) {
+    const hraw = await env.ROUTES.get(`hnd:${normalizeHandle(String(body.handle))}`);
+    if (hraw) { try { const h = JSON.parse(hraw) as { key_hash?: string }; if (h.key_hash) storeKey = `ck:${h.key_hash}`; } catch { /* 400 below */ } }
+  }
+  if (!storeKey) return Response.json({ error: "provide a valid key, key_hash, or registered handle" }, { status: 400 });
+  const raw = await env.ROUTES.get(storeKey);
+  if (!raw) return Response.json({ granted: false, reason: "not found" }, { status: 404 });
+  const rec = JSON.parse(raw) as ContribKey;
+  rec.credits = (rec.credits ?? 0) + credits;
+  if (body.tier === "free" || body.tier === "pro") rec.tier = body.tier;
+  await env.ROUTES.put(storeKey, JSON.stringify(rec));
+  return Response.json({ granted: true, handle: rec.handle, tier: rec.tier ?? "free", credits: rec.credits });
+}
+
+/** GET /v1/usage — key-holder self-service (Bearer / x-api-key): tier, prepaid
+ * credits, verified-only queries served. Never exposes the key or its hash. */
+async function usageEndpoint(env: Env, request: Request): Promise<Response> {
+  const rawKey = bearerKey(request);
+  if (!rawKey) return Response.json({ error: "pass your contributor key as 'Authorization: Bearer wmk_…' or 'x-api-key'" }, { status: 401, headers: CORS });
+  const k = await lookupContribKey(env, rawKey);
+  if (!k || k.rec.revoked) return Response.json({ error: "invalid or revoked key" }, { status: 401, headers: CORS });
+  return Response.json({
+    handle: k.rec.handle,
+    tier: k.rec.tier ?? "free",
+    credits: k.rec.credits ?? 0,
+    queries_used: k.rec.queries_used ?? 0,
+    contributions: k.rec.contributions,
+    hourly_contribute_cap: contribCapFor(k.rec),
+  }, { headers: { ...CORS, "Cache-Control": "no-store" } });
 }
 
 /** POST /admin/upgrade-key {key|key_hash, tier:"free"|"pro"} — WRITE_KEY-gated (M1).
@@ -1771,7 +1906,7 @@ export default {
       // probe=1: our own smoke/eval/build tooling self-identifies so demand
       // telemetry can separate human playground queries from our probes.
       const isProbe = searchParams.get("probe") === "1";
-      return withServiceDesc(searchEndpoint(env, q, ctx, isProbe));
+      return withServiceDesc(searchEndpoint(env, request, q, ctx, isProbe));
     }
     if (pathname === "/admin/merge-index" && request.method === "POST") {
       return mergeIndex(env, request.headers.get("x-write-key"), request);
@@ -1824,6 +1959,9 @@ export default {
     if (pathname === "/admin/revoke-key" && request.method === "POST") return revokeKey(env, request.headers.get("x-write-key"), request);
     // v0.7 monetization (M1) — Pro key entitlements
     if (pathname === "/admin/upgrade-key" && request.method === "POST") return upgradeKey(env, request.headers.get("x-write-key"), request);
+    // R0 — metered Pro via prepaid credits (2026-07-10)
+    if (pathname === "/admin/grant-credits" && request.method === "POST") return grantCredits(env, request.headers.get("x-write-key"), request);
+    if (pathname === "/v1/usage" && request.method === "GET") return withServiceDesc(usageEndpoint(env, request));
     if (pathname === "/admin/priority-queue" && request.method === "GET") return priorityQueueList(env, request.headers.get("x-write-key"));
     // v0.7 — paid route requests (bounty intake for /pricing)
     if (pathname === "/v1/route-requests" && request.method === "POST") return routeRequestCreate(env, request);
@@ -2341,8 +2479,47 @@ async function activityEndpoint(env: Env, limit: number): Promise<Response> {
  *  isProbe: caller self-identified as our own tooling via ?probe=1 — the query
  *  event is logged under domain "probe" (still written, so the smoke suite's
  *  telemetry-liveness criterion keeps working) instead of "web-playground". */
-async function searchEndpoint(env: Env, q: string, ctx: ExecutionContext, isProbe = false): Promise<Response> {
+async function searchEndpoint(env: Env, request: Request, q: string, ctx: ExecutionContext, isProbe = false): Promise<Response> {
   if (!q.trim()) return Response.json({ routes: [] }, { headers: CORS });
+  // /search result shape (shared by the free path below and verified-only).
+  const searchResult = (r: Route) => ({
+    id: r.id, task: r.task, domain: r.domain,
+    steps: r.steps, gotchas: r.gotchas,
+    success: r.attestations.success, failure: r.attestations.failure,
+    verification: r.verification ?? { status: "sampled", method: "legacy-file-sample" },
+    url: `https://mcp.waymark.network/r/${r.id}`,
+  });
+  // R0 — verified-only retrieval (Pro, prepaid credits). Deliberately OUTSIDE
+  // the shared retrieval cache (personalized + metered; results filtered to
+  // verification:"verified" would poison the shared cache and vice versa) and
+  // never edge-cached (Cache-Control: no-store; /search isn't in the fetch()
+  // allowlist anyway). The free path below is byte-for-byte unchanged.
+  const vOnly = ["1", "true"].includes(new URL(request.url).searchParams.get("verified_only") ?? "");
+  if (vOnly) {
+    const rawKey = bearerKey(request) ?? new URL(request.url).searchParams.get("api_key");
+    const pk = await proKeyWithCredits(env, rawKey);
+    if (!pk) {
+      return Response.json({ routes: [], ...PRO_UPSELL }, { status: 402, headers: { ...CORS, "Cache-Control": "no-store" } });
+    }
+    const t0 = Date.now();
+    const routes = (await retrieve(env, q, undefined, 15))
+      .filter((r) => (r.verification?.status ?? "sampled") === "verified")
+      .slice(0, 5);
+    const ms = Date.now() - t0;
+    const vRanked = routes.map(searchResult);
+    let creditsRemaining = pk.rec.credits ?? 0;
+    if (vRanked.length > 0) creditsRemaining = await consumeCredit(env, pk); // zero-result queries are free
+    ctx.waitUntil(logEvent(env, "query", { task: q.slice(0, 140), domain: isProbe ? "probe" : "web-playground", results: vRanked.length, ms, verified_only: true }));
+    const vBody: Record<string, unknown> = vRanked.length > 0
+      ? { routes: vRanked, verified_only: true, credits_remaining: creditsRemaining }
+      : {
+          routes: [], verified_only: true, credits_remaining: creditsRemaining,
+          note: "No verified route matched — no credit was charged. Waymark refuses to guess rather than serve a wrong route.",
+          no_result_cta: NO_RESULT_CTA,
+          request_route: { what: "Commission a fact-checked route for this exact task ($25 bounty).", price_usd: 25, url: "https://waymark.network/pricing", checkout: "https://buy.stripe.com/9B69AT9RsfKHcuZ6Wiao80f" },
+        };
+    return Response.json(vBody, { headers: { ...CORS, "Cache-Control": "no-store" } });
+  }
   // Cache the *billed Vectorize retrieval result* (not the whole response) keyed
   // by the normalized query, so repeated identical /search queries — crawlers,
   // social unfurlers, the smoke suite's own 2x/run probes, and naive floods —
@@ -2369,13 +2546,7 @@ async function searchEndpoint(env: Env, q: string, ctx: ExecutionContext, isProb
     const t0 = Date.now();
     const routes = await retrieve(env, q, undefined, 5);
     retrievalMs = Date.now() - t0;
-    ranked = routes.map((r) => ({
-        id: r.id, task: r.task, domain: r.domain,
-        steps: r.steps, gotchas: r.gotchas,
-        success: r.attestations.success, failure: r.attestations.failure,
-        verification: r.verification ?? { status: "sampled", method: "legacy-file-sample" },
-        url: `https://mcp.waymark.network/r/${r.id}`,
-      }));
+    ranked = routes.map(searchResult);
     // Store the ranked array (not the CORS response) with a positive max-age so
     // caches.default actually retains it; key is never dispatched, only matched.
     ctx.waitUntil(cache.put(cacheKey, Response.json(ranked, { headers: { "Cache-Control": "public, max-age=60" } })));
@@ -2394,6 +2565,7 @@ async function searchEndpoint(env: Env, q: string, ctx: ExecutionContext, isProb
       : {
           routes: [],
           note: "No confident route match — Waymark refuses to guess rather than serve a wrong route.",
+          no_result_cta: NO_RESULT_CTA,
           request_route: {
             what: "Commission a fact-checked route for this exact task ($25 bounty — you describe the task, we research, verify, and publish it).",
             price_usd: 25,
@@ -2473,6 +2645,7 @@ footer{color:var(--dim);font-size:13px;margin-top:28px}</style></head><body>
 <input id="q" type="search" placeholder="Filter domains — e.g. stripe, salesforce, aws…" autocomplete="off" aria-label="Filter domains">
 <p id="none">No domain matches. Try the <a href="/dashboard">semantic search on the dashboard</a> for task-level lookup.</p>
 <div class="grid">${cards}</div>
+<div style="background:var(--panel);border:1px solid var(--accent);border-radius:12px;padding:16px 20px;margin-top:24px;font-size:14px">Need a route verified for <b>your</b> stack, or one we don't have yet? <a href="https://buy.stripe.com/9B69AT9RsfKHcuZ6Wiao80f">Custom route — $25</a> · Teams: <a href="https://buy.stripe.com/3cI6oH7JkburgLf0xUao80h">Pilot — $750/mo</a> · <a href="https://waymark.network/pricing">all plans</a></div>
 <footer>Waymark — the shared route map of the agent economy · <a href="https://waymark.network/pricing">request a route ($25)</a> · <code>claude mcp add --transport http waymark https://mcp.waymark.network/mcp</code></footer>
 <script>
 var q=document.getElementById("q"),cards=[].slice.call(document.querySelectorAll(".dom")),none=document.getElementById("none");
@@ -2586,6 +2759,7 @@ footer{color:var(--dim);font-size:13px;margin-top:28px}</style></head><body>
 <input id="q" type="search" placeholder="Filter these routes — e.g. webhook, oauth, rate limit…" autocomplete="off" aria-label="Filter routes">
 <p id="none">No routes match. Try the <a href="/dashboard">semantic search on the dashboard</a> — keyword filtering here is exact-match only.</p>
 ${sections}
+<div style="background:var(--panel);border:1px solid var(--accent);border-radius:12px;padding:16px 20px;margin-top:24px;font-size:14px">Need one of these verified for <b>your</b> stack, or a ${t} route we don't have yet? <a href="https://buy.stripe.com/9B69AT9RsfKHcuZ6Wiao80f">Custom route — $25</a> · Teams: <a href="https://buy.stripe.com/3cI6oH7JkburgLf0xUao80h">Pilot — $750/mo</a> · <a href="https://waymark.network/pricing">all plans</a></div>
 <footer>Waymark — the shared route map of the agent economy · <a href="https://waymark.network/pricing">request a route ($25)</a> · <code>claude mcp add --transport http waymark https://mcp.waymark.network/mcp</code></footer>
 <script>
 var q=document.getElementById("q"),rows=[].slice.call(document.querySelectorAll("a.row")),none=document.getElementById("none");
@@ -2804,6 +2978,8 @@ ${related.length ? `<div class="panel rel"><h2>Related routes</h2>${related.map(
 <div class="panel cta"><h2>Give your agent this knowledge — and ${scaleMore} routes</h2>
 One MCP install gives any agent live access to the full route map${scaleDomains}, with trust scores updated by agent consensus:
 <code>claude mcp add --transport http waymark https://mcp.waymark.network/mcp</code></div>
+<div class="panel cta"><h2>Need this verified for your stack — or a route we don't have yet?</h2>
+We author + individually verify a route for your exact task within 24h. <a href="https://buy.stripe.com/9B69AT9RsfKHcuZ6Wiao80f">Custom route — $25</a> · Teams: <a href="https://buy.stripe.com/3cI6oH7JkburgLf0xUao80h">Pilot — $750/mo</a> · <a href="https://waymark.network/pricing">all plans</a></div>
 <footer>Waymark — the shared route map of the agent economy · <a href="https://mcp.waymark.network/dashboard">live dashboard</a> · <a href="https://waymark.network/benchmark">benchmark</a> · <a href="https://waymark.network/pricing">request a route ($25)</a> · <a href="${pageUrl}.json">this route as JSON</a></footer>
 </body></html>`;
   return new Response(html, { headers: { "Content-Type": "text/html;charset=utf-8", "Cache-Control": "public, max-age=300" } });
@@ -2910,8 +3086,13 @@ function openApiSpec(env: Env) {
           parameters: [
             { name: "q", in: "query", required: true, description: "Natural-language task description.", schema: { type: "string", maxLength: 256 } },
             { name: "probe", in: "query", required: false, description: "Set to `1` only by Waymark's own smoke/eval/build tooling so demand telemetry can separate internal probes from organic queries. Omit for normal use.", schema: { type: "string", enum: ["1"] } },
+            { name: "verified_only", in: "query", required: false, description: "Pro (prepaid credits): return only individually fact-checked (verification:'verified') routes. Requires a Pro contributor key with credits>0, passed as `Authorization: Bearer wmk_…`, `x-api-key`, or `api_key` query param. 1 credit per served query; zero-result queries are free. Without entitlement the endpoint answers 402 with upgrade instructions. Normal queries (omit this) stay free and keyless.", schema: { type: "string", enum: ["1", "true"] } },
           ],
           responses: {
+            "402": {
+              description: "verified_only was requested without a credited Pro key. Body explains how to upgrade (https://waymark.network/pricing); free keyless search remains available without verified_only.",
+              content: { "application/json": { schema: { type: "object", properties: { routes: { type: "array", maxItems: 0 }, error: { type: "string", const: "pro_required" }, detail: { type: "string" }, how: { type: "string" }, pricing: { type: "string", format: "uri" }, checkout: { type: "string", format: "uri" } } } } },
+            },
             "200": {
               description: "Ranked routes (possibly empty on a low-confidence/no-match query). Zero-result responses additionally carry `note` and `request_route` — the paid path to commission a fact-checked route for the unmatched task.",
               headers: { "X-Search-Cache": { description: "`hit` if the retrieval result was served from edge cache, else `miss`.", schema: { type: "string", enum: ["hit", "miss"] } } },
@@ -2979,6 +3160,17 @@ function openApiSpec(env: Env) {
             "400": { description: "Invalid or reserved handle.", content: { "application/json": { schema: { $ref: "#/components/schemas/ApiError" } } } },
             "409": { description: "Handle already registered (handles are unique, first come).", content: { "application/json": { schema: { $ref: "#/components/schemas/ApiError" } } } },
             "429": { description: "Rate limited (per-IP or network-wide).", content: { "application/json": { schema: { $ref: "#/components/schemas/ApiError" } } } },
+          },
+        },
+      },
+      "/v1/usage": {
+        get: {
+          operationId: "getUsage",
+          summary: "Key-holder usage + prepaid credit balance",
+          description: "Self-service usage for a contributor key: tier (free|pro), prepaid credit balance, and verified-only queries served. Pass the key as `Authorization: Bearer wmk_…` or `x-api-key`.",
+          responses: {
+            "200": { description: "Usage for the presented key.", content: { "application/json": { schema: { type: "object", required: ["handle", "tier", "credits", "queries_used"], properties: { handle: { type: "string" }, tier: { type: "string", enum: ["free", "pro"] }, credits: { type: "integer" }, queries_used: { type: "integer" }, contributions: { type: "integer" }, hourly_contribute_cap: { type: "integer" } } } } } },
+            "401": { description: "Missing, invalid, or revoked key.", content: { "application/json": { schema: { $ref: "#/components/schemas/ApiError" } } } },
           },
         },
       },
