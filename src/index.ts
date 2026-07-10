@@ -600,7 +600,18 @@ export class WaymarkMCP extends McpAgent<Env> {
               text:
                 ranked.length > 0
                   ? JSON.stringify({ routes: ranked, note: "After completing the task, call waymark_attest with the route_id and outcome." }, null, 2)
-                  : JSON.stringify({ routes: [], note: "No routes yet for this task. After you complete it, call waymark_contribute so the next agent doesn't start from zero." }),
+                  : JSON.stringify({
+                      routes: [],
+                      note: "No routes yet for this task. After you complete it, call waymark_contribute so the next agent doesn't start from zero.",
+                      // Moment-of-intent conversion (revenue backlog #2): the agent's
+                      // operator is the buyer; agents relay this verbatim when the
+                      // missing route blocked or slowed the task.
+                      request_route: {
+                        what: "If this task matters to your operator, a human can commission a fact-checked route for it ($25 bounty).",
+                        price_usd: 25,
+                        url: "https://waymark.network/pricing",
+                      },
+                    }),
             },
           ],
         };
@@ -2370,7 +2381,27 @@ async function searchEndpoint(env: Env, q: string, ctx: ExecutionContext, isProb
     ctx.waitUntil(cache.put(cacheKey, Response.json(ranked, { headers: { "Cache-Control": "public, max-age=60" } })));
   }
   ctx.waitUntil(logEvent(env, "query", { task: q.slice(0, 140), domain: isProbe ? "probe" : "web-playground", results: ranked.length, ms: retrievalMs }));
-  return Response.json({ routes: ranked }, { headers: { ...CORS, "Cache-Control": "public, max-age=60", "X-Search-Cache": retrievalMs < 0 ? "hit" : "miss" } });
+  // Moment-of-intent conversion (revenue backlog #2, 2026-07-10): a zero-result
+  // response IS the demand signal — the caller just told us exactly which route
+  // is missing. Surface the paid path right there, additively (consumers that
+  // only read `routes` are unaffected; the empty-`q` early return above stays
+  // bare because a blank query carries no intent). Copy is honest: we refuse
+  // low-confidence guesses by design (VEC_MIN_SCORE + coherence gates), and the
+  // $25 bounty is the live, shipping intake (v0.7 route requests + /pricing).
+  const body: Record<string, unknown> =
+    (ranked as unknown[]).length > 0
+      ? { routes: ranked }
+      : {
+          routes: [],
+          note: "No confident route match — Waymark refuses to guess rather than serve a wrong route.",
+          request_route: {
+            what: "Commission a fact-checked route for this exact task ($25 bounty — you describe the task, we research, verify, and publish it).",
+            price_usd: 25,
+            url: "https://waymark.network/pricing",
+            checkout: "https://buy.stripe.com/9B69AT9RsfKHcuZ6Wiao80f",
+          },
+        };
+  return Response.json(body, { headers: { ...CORS, "Cache-Control": "public, max-age=60", "X-Search-Cache": retrievalMs < 0 ? "hit" : "miss" } });
 }
 
 /** Server-rendered directory of route domains (SEO + humans). Each domain links
@@ -2882,9 +2913,16 @@ function openApiSpec(env: Env) {
           ],
           responses: {
             "200": {
-              description: "Ranked routes (possibly empty on a low-confidence/no-match query).",
+              description: "Ranked routes (possibly empty on a low-confidence/no-match query). Zero-result responses additionally carry `note` and `request_route` — the paid path to commission a fact-checked route for the unmatched task.",
               headers: { "X-Search-Cache": { description: "`hit` if the retrieval result was served from edge cache, else `miss`.", schema: { type: "string", enum: ["hit", "miss"] } } },
-              content: { "application/json": { schema: { type: "object", required: ["routes"], properties: { routes: { type: "array", items: { $ref: "#/components/schemas/RouteResult" } } } } } },
+              content: { "application/json": { schema: { type: "object", required: ["routes"], properties: {
+                routes: { type: "array", items: { $ref: "#/components/schemas/RouteResult" } },
+                note: { type: "string", description: "Present only when `routes` is empty: why nothing was served (Waymark refuses low-confidence matches rather than guess)." },
+                request_route: { type: "object", description: "Present only when `routes` is empty: how to commission a fact-checked route for this exact task ($25 bounty).", properties: {
+                  what: { type: "string" }, price_usd: { type: "number", const: 25 },
+                  url: { type: "string", format: "uri" }, checkout: { type: "string", format: "uri" },
+                } },
+              } } } },
             },
           },
         },
