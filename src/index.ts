@@ -185,6 +185,39 @@ const bigrams = (tokens: string[]) => {
   return out;
 };
 
+/* ---------------- item 81: time-decay on attestation weight ----------------
+ * Publicly promised in the PH launch thread (2026-07-12, @galdayan exchange):
+ * "an old, heavily-attested route does keep looking authoritative until a
+ * failure report or drift check catches it" must stop being true.
+ * Model: evidence ages toward the NEUTRAL PRIOR, never toward zero — an old
+ * 100%-success route decays to "unrated", not to "failing" (decay-to-zero
+ * would manufacture a new kind of confidently-wrong). freshness halves every
+ * TRUST_HALF_LIFE_DAYS since the last attestation — the same 60-day half-life
+ * /drift has published since item 36, one constant, one story:
+ *   effective_trust = 0.5 + (laplace(s,f) − 0.5) × 0.5^(age_days / 60)
+ * A 14×-success route untouched for 6 months carries ~0.56 effective trust
+ * (vs 0.94 raw) and no longer outranks fresh evidence; ONE new attestation
+ * (either outcome) restores full weight. Applied in BOTH retrieval paths
+ * (keyword trust factor + vector re-rank via servingScore) and surfaced in
+ * every response that previously printed a bare success_rate — raw tallies
+ * stay visible everywhere (nothing is averaged away; the decayed number is
+ * shown NEXT TO the evidence, not instead of it). Freshness is clamped at 1
+ * so a clock-skewed lastAt can never inflate trust above its raw value. */
+const TRUST_HALF_LIFE_DAYS = 60; // matches /drift half_life_days — one constant, one story
+const attestationFreshness = (r: Route, now = Date.now()): number =>
+  r.attestations.lastAt
+    ? Math.min(1, Math.pow(0.5, (now - new Date(r.attestations.lastAt).getTime()) / (TRUST_HALF_LIFE_DAYS * 86400_000)))
+    : 1; // never attested ⇒ laplace already sits at the prior; nothing to decay
+const effectiveTrust = (r: Route, now = Date.now()): number => {
+  const a = r.attestations;
+  const laplace = (a.success + 1) / (a.success + a.failure + 2);
+  return 0.5 + (laplace - 0.5) * attestationFreshness(r, now);
+};
+const evidenceAgeDays = (r: Route): number | null =>
+  r.attestations.lastAt
+    ? Math.max(0, Math.round((Date.now() - new Date(r.attestations.lastAt).getTime()) / 86400_000))
+    : null;
+
 interface Scored { e: IdxEntry; score: number; coverage: number }
 
 /** IDF + bigram + domain-boost + trust scoring with a refusal threshold. */
@@ -206,8 +239,7 @@ function rankIndex(idx: IdxEntry[], query: string, domainHint: string | undefine
     if (matched.size === 0) continue;
     for (const b of bigrams(toks)) if (qBi.has(b)) s += 1.5; // phrase evidence
     if (domainHint && e.domain.toLowerCase() === domainHint.toLowerCase()) s *= 1.5;
-    const trust = (e.attestations.success + 1) / (e.attestations.success + e.attestations.failure + 2);
-    s *= 0.5 + trust; // trust scales 0.5x–1.5x
+    s *= 0.5 + effectiveTrust(e); // trust scales 0.5x–1.5x — time-decayed since item 81 (stale evidence reverts toward the prior)
     if (e.verification?.status === "unverified") s *= UNVERIFIED_SERVING_FACTOR; // BLOCKER #1: don't serve unverified as authoritative
     const coverage = matched.size / Math.min(qSet.size, 6);
     scored.push({ e, score: s, coverage });
@@ -337,8 +369,14 @@ function lexicallyGrounded(query: string, domainHint: string | undefined) {
  * deprioritize them hard so any verified/operator route wins, and the agent
  * always sees verification.status in the response. */
 const UNVERIFIED_SERVING_FACTOR = 0.12;
+/* item 81: the vector path now also weighs attestation consensus (time-decayed,
+ * same bounded 0.5x–1.5x factor as the keyword path). Before this, failures
+ * only counted against a route in the keyword FALLBACK — the primary semantic
+ * path ranked purely by similarity × verification, so a failing-but-similar
+ * route could still serve first. Order-only change: no gate/threshold reads
+ * servingScore, so refusal behavior is untouched. */
 const servingScore = (r: Route, base: number) =>
-  base * (r.verification?.status === "unverified" ? UNVERIFIED_SERVING_FACTOR : 1);
+  base * (r.verification?.status === "unverified" ? UNVERIFIED_SERVING_FACTOR : 1) * (0.5 + effectiveTrust(r));
 
 async function embed(env: Env, texts: string[]): Promise<number[][]> {
   const res = (await env.AI.run(EMBED_MODEL, { text: texts })) as { data: number[][] };
@@ -606,6 +644,9 @@ export class WaymarkMCP extends McpAgent<Env> {
                 ? r.attestations.success / (r.attestations.success + r.attestations.failure)
                 : null,
             attestation_count: r.attestations.success + r.attestations.failure,
+            // item 81: decayed weight shown NEXT TO the raw tally, never instead of it.
+            effective_trust: +effectiveTrust(r).toFixed(2),
+            evidence_age_days: evidenceAgeDays(r),
             verification: r.verification ?? { status: "sampled", method: "legacy-file-sample" },
           }));
         // R0: 1 credit per SERVED verified-only query (zero-result = no charge).
@@ -636,6 +677,10 @@ export class WaymarkMCP extends McpAgent<Env> {
                   ? JSON.stringify({
                       routes: ranked,
                       ...(proKey ? { verified_only: true, credits_remaining: creditsRemaining } : {}),
+                      trust_decay: {
+                        half_life_days: TRUST_HALF_LIFE_DAYS,
+                        model: "effective_trust = 0.5 + (laplace(success,failure) - 0.5) * 0.5^(days_since_last_attestation/60) — attestation weight reverts toward the neutral prior as evidence ages; raw tallies are never hidden.",
+                      },
                       note: "After completing the task, call waymark_attest with the route_id and outcome.",
                     }, null, 2)
                   : JSON.stringify({
@@ -2441,6 +2486,7 @@ async function routesEndpoint(request: Request, env: Env): Promise<Response> {
           ? r.attestations.success / (r.attestations.success + r.attestations.failure)
           : null,
       last_attested: r.attestations.lastAt,
+      effective_trust: +effectiveTrust(r).toFixed(3), // item 81: time-decayed (60d half-life)
       verification: r.verification?.status ?? "sampled",
     }))
     .sort((a, b) => (b.success + b.failure) - (a.success + a.failure));
@@ -2486,6 +2532,8 @@ async function searchEndpoint(env: Env, request: Request, q: string, ctx: Execut
     id: r.id, task: r.task, domain: r.domain,
     steps: r.steps, gotchas: r.gotchas,
     success: r.attestations.success, failure: r.attestations.failure,
+    effective_trust: +effectiveTrust(r).toFixed(2), // item 81: time-decayed (60d half-life)
+    evidence_age_days: evidenceAgeDays(r),
     verification: r.verification ?? { status: "sampled", method: "legacy-file-sample" },
     url: `https://mcp.waymark.network/r/${r.id}`,
   });
@@ -2833,6 +2881,10 @@ async function routeJson(request: Request, env: Env, id: string): Promise<Respon
       last_attested: r.attestations.lastAt,
     },
     success_rate: total > 0 ? r.attestations.success / total : null,
+    // item 81: time-decayed trust — the number retrieval actually weighs.
+    effective_trust: +effectiveTrust(r).toFixed(3),
+    evidence_age_days: evidenceAgeDays(r),
+    trust_half_life_days: TRUST_HALF_LIFE_DAYS,
     verification: r.verification ?? { status: "sampled", method: "legacy-file-sample" },
     url: `https://mcp.waymark.network/r/${r.id}`,
   });
@@ -2967,7 +3019,7 @@ footer{color:var(--dim);font-size:13px;margin-top:28px}
 <nav class="crumbs" aria-label="Breadcrumb"><a href="https://waymark.network">Waymark</a><span class="sep">/</span><a href="https://mcp.waymark.network/routes">Routes</a><span class="sep">/</span><a href="https://mcp.waymark.network/routes/${domainSlug(r.domain)}">${d}</a></nav>
 <h1>${t}</h1>
 <div class="meta">domain: <b>${d}</b> · ${r.steps.length} steps · contributed by ${escapeHtml(r.contributor)}</div>
-<div class="vbadge v-${vStatus}"><span class="vp">${vProvenance}</span><span class="va">community attestations: ${r.attestations.success}✓ / ${r.attestations.failure}✗${attestPct !== null ? ` · ${attestPct}% success` : ""}${total > 0 ? ` · ${keyed} keyed / ${anon} anonymous` : ""}</span></div>
+<div class="vbadge v-${vStatus}"><span class="vp">${vProvenance}</span><span class="va">community attestations: ${r.attestations.success}✓ / ${r.attestations.failure}✗${attestPct !== null ? ` · ${attestPct}% success` : ""}${total > 0 ? ` · ${keyed} keyed / ${anon} anonymous` : ""}${total > 0 ? ` · effective trust ${Math.round(effectiveTrust(r) * 100)}% (evidence ${evidenceAgeDays(r)}d old · decays on a ${TRUST_HALF_LIFE_DAYS}-day half-life toward unrated)` : ""}</span></div>
 ${domainDrifted ? `<div class="panel" style="border-left:3px solid var(--warn)"><h2 style="color:var(--warn)">This API has logged drift</h2><b>${d}</b> has changed in ways that broke documented routes before — agents on stale knowledge fail silently. <a href="https://mcp.waymark.network/drift#alerts">Get alerted when ${d} drifts again →</a></div>` : ""}<div class="panel"><h2>${stepsHeading}</h2><ol>${r.steps.map((s) => `<li>${escapeHtml(s)}</li>`).join("")}</ol></div>
 ${r.gotchas.length ? `<div class="panel g"><h2>Known gotchas</h2><ul>${r.gotchas.map((g) => `<li>${escapeHtml(g)}</li>`).join("")}</ul></div>` : ""}
 ${related.length ? `<div class="panel rel"><h2>Related routes</h2>${related.map((x) => {
@@ -3026,6 +3078,7 @@ const LLMS_TXT = `# Waymark
 
 MCP endpoint (streamable HTTP): https://mcp.waymark.network/mcp
 Tools (4): waymark_query (find routes), waymark_register (mint a free contributor key, no auth — one call returns a key), waymark_contribute (add a route, key-gated), waymark_attest (report an outcome to build consensus trust; optional api_key attributes it to your handle)
+Trust model: attestation weight decays with evidence age (60-day half-life) toward a neutral prior — old heavily-attested routes stop outranking fresh evidence; raw tallies always shown alongside.
 Install (Claude Code): claude mcp add --transport http waymark https://mcp.waymark.network/mcp
 
 ## Resources
@@ -3210,6 +3263,9 @@ function openApiSpec(env: Env) {
             contributor: { type: "string" }, created: { type: "string", format: "date-time" },
             attestations: { type: "object", properties: { success: { type: "integer" }, failure: { type: "integer" }, keyed_success: { type: "integer", description: "Attestations attributed to a validated contributor key. A subset of success, not a separate tally." }, keyed_failure: { type: "integer", description: "Keyed subset of failure." }, last_attested: { type: ["string", "null"], format: "date-time" } } },
             success_rate: { type: ["number", "null"], description: "success / (success+failure), or null if never attested." },
+            effective_trust: { type: "number", description: "Time-decayed trust: 0.5 + (laplace(success,failure) - 0.5) * 0.5^(days_since_last_attestation/60). Reverts toward the 0.5 neutral prior as evidence ages; this is the number retrieval ranking weighs." },
+            evidence_age_days: { type: ["integer", "null"], description: "Days since the last attestation, or null if never attested." },
+            trust_half_life_days: { type: "integer", description: "Half-life of attestation weight in days (60 — matches /drift)." },
             verification: { $ref: "#/components/schemas/Verification" }, url: { type: "string", format: "uri" },
           },
         },
