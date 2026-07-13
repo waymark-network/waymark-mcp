@@ -2710,6 +2710,67 @@ q.addEventListener("input",function(){
   return new Response(html, { headers: { "Content-Type": "text/html;charset=utf-8", "Cache-Control": "public, max-age=300", "Vary": "Accept" } });
 }
 
+/* Item 85: internal links from route pages to the in-depth guides on
+ * waymark.network/guides — the deep conversion surfaces (doc-verified fix +
+ * gotchas + $25/Pilot CTA). The guides already link route pages; until this
+ * map nothing linked back, so the ~13k-page crawlable route surface passed
+ * zero link equity (and zero warm readers) to the guides.
+ * Keys are EXACT corpus `domain` strings (lookup lowercases). Generic category
+ * domains (e.g. "identity-general") are DELIBERATELY excluded — a guide banner
+ * must never imply provider coverage it doesn't have. Anchor text = the guide's
+ * real H1 (or a shortened, claim-free version of it), never a broadened claim.
+ * CONVENTION: a run that ships a new guide adds its corpus domain(s) here in
+ * the same run (grep the guide's /r/ links, read each route's `domain`). */
+const GUIDE_FOR_DOMAIN: Record<string, { slug: string; title: string }> = {
+  "docs.attio.com": { slug: "attio-webhook-signature-verification", title: "Verify Attio webhook signatures" },
+  "portal.websupervisor.net": { slug: "comap-websupervisor-cloud-api", title: "ComAp WebSupervisor Cloud API — two-key auth, tokens, and the endpoint map" },
+  "docusign.com": { slug: "docusign-embedded-signing", title: "DocuSign embedded signing" },
+  "hl7.org": { slug: "fhir-bulk-export", title: "FHIR Bulk Data $export gotchas" },
+  "hl7.org/fhir/uv/bulkdata": { slug: "fhir-bulk-export", title: "FHIR Bulk Data $export gotchas" },
+  "hubspot.com": { slug: "hubspot-create-or-update-contact", title: "HubSpot: create or update a contact idempotently (upsert)" },
+  "atlassian-jira": { slug: "jira-api-v3-adf-formatting", title: "Jira API v3 and ADF formatting" },
+  "api-ca.metrc.com": { slug: "metrc-create-packages-from-harvest", title: "Create packages from a harvest in Metrc — endpoint, tag rules, and the 10-object cap" },
+  "docs.oracle.com/en/cloud/saas/netsuite": { slug: "netsuite-suitetalk-auth", title: "NetSuite SuiteTalk REST authentication" },
+  "netsuite": { slug: "netsuite-suitetalk-auth", title: "NetSuite SuiteTalk REST authentication" },
+  "plaid.com": { slug: "plaid-webhook-verification", title: "Plaid webhook verification" },
+  "plaid.com/docs/auth": { slug: "plaid-webhook-verification", title: "Plaid webhook verification" },
+  "plaid.com/docs/identity-verification": { slug: "plaid-webhook-verification", title: "Plaid webhook verification" },
+  "developer.intuit.com": { slug: "quickbooks-oauth-refresh-token-rotation", title: "QuickBooks OAuth refresh token rotation" },
+  "quickbooks.com": { slug: "quickbooks-oauth-refresh-token-rotation", title: "QuickBooks OAuth refresh token rotation" },
+  "tsheetsteam.github.io/api_docs": { slug: "quickbooks-oauth-refresh-token-rotation", title: "QuickBooks OAuth refresh token rotation" },
+  "redpanda": { slug: "redpanda-iceberg-topics-glue-catalog", title: "Redpanda Iceberg Topics with an AWS Glue catalog" },
+  "developer.salesforce.com": { slug: "salesforce-bulk-api-2-limits", title: "Salesforce Bulk API 2.0 limits" },
+  "salesforce.com": { slug: "salesforce-bulk-api-2-limits", title: "Salesforce Bulk API 2.0 limits" },
+  "shopify.com": { slug: "shopify-graphql-rate-limits", title: "Shopify GraphQL Admin API rate limits" },
+  "shopify.dev": { slug: "shopify-graphql-rate-limits", title: "Shopify GraphQL Admin API rate limits" },
+  "docs.stripe.com": { slug: "stripe-webhook-signature-verification", title: "Stripe webhook signature verification pitfalls" },
+  "docs.stripe.com/webhooks/signatures": { slug: "stripe-webhook-signature-verification", title: "Stripe webhook signature verification pitfalls" },
+  "stripe.com": { slug: "stripe-webhook-signature-verification", title: "Stripe webhook signature verification pitfalls" },
+  "twilio-verify": { slug: "twilio-verify-authy-migration", title: "Twilio Verify for teams leaving Authy" },
+  "twilio.com": { slug: "twilio-verify-authy-migration", title: "Twilio Verify for teams leaving Authy" },
+  "twilio.com/docs/verify": { slug: "twilio-verify-authy-migration", title: "Twilio Verify for teams leaving Authy" },
+  "typeform.com/developers": { slug: "typeform-webhook-hmac-verification", title: "Verify Typeform webhook HMAC signatures" },
+  "developer.uber.com": { slug: "uber-direct-webhook-signature-verification", title: "Verify Uber Direct webhook signatures" },
+};
+
+/** Slug-keyed view of GUIDE_FOR_DOMAIN for /routes/{slug} pages (built once
+ *  per isolate; the map is a compile-time constant). */
+let guideBySlug: Map<string, { slug: string; title: string }> | null = null;
+function guideForSlug(slug: string): { slug: string; title: string } | undefined {
+  if (!guideBySlug) {
+    guideBySlug = new Map();
+    for (const [dom, g] of Object.entries(GUIDE_FOR_DOMAIN)) {
+      if (!guideBySlug.has(domainSlug(dom))) guideBySlug.set(domainSlug(dom), g);
+    }
+  }
+  return guideBySlug.get(slug);
+}
+
+/** Shared "in-depth guide" panel (item 85) for /r/{id} and /routes/{slug}. */
+function guidePanel(guide: { slug: string; title: string }, domEsc: string): string {
+  return `<div class="panel" style="border-left:3px solid var(--accent)"><h2>In-depth guide</h2><a href="https://waymark.network/guides/${guide.slug}">${escapeHtml(guide.title)}</a> — the full failure-mode walkthrough related to <b>${domEsc}</b>, checked against official docs, with linked verified routes.</div>`;
+}
+
 /** Bounded per-domain route listing (item 6c). One page per domain keeps each
  *  cold load small (largest domain ~125 routes today) instead of the ~2.6 MB
  *  full-index render the old /routes page produced. Resolves the URL slug back
@@ -2742,6 +2803,8 @@ async function routeDomainPage(env: Env, slugRaw: string): Promise<Response> {
   const title = domainNames.join(", ");
   const t = escapeHtml(title);
   const pageUrl = `https://mcp.waymark.network/routes/${slug}`;
+  // Item 85: provider deep-dive guide link (see GUIDE_FOR_DOMAIN).
+  const guide = guideForSlug(slug);
   const trustLabel = (r: Route) => {
     const n = r.attestations.success + r.attestations.failure;
     return n > 0 ? Math.round((r.attestations.success / n) * 100) + "% success" : "unrated";
@@ -2804,7 +2867,7 @@ footer{color:var(--dim);font-size:13px;margin-top:28px}</style></head><body>
 <nav class="crumbs" aria-label="Breadcrumb"><a href="https://waymark.network">Waymark</a><span class="sep">/</span><a href="https://mcp.waymark.network/routes">Routes</a><span class="sep">/</span><span>${t}</span></nav>
 <h1>${t}</h1>
 <div class="meta">${total} route${total === 1 ? "" : "s"} · trust scored by agent consensus · <a href="/routes">all domains</a> · <a href="/dashboard">semantic search</a></div>
-<input id="q" type="search" placeholder="Filter these routes — e.g. webhook, oauth, rate limit…" autocomplete="off" aria-label="Filter routes">
+${guide ? guidePanel(guide, t) : ""}<input id="q" type="search" placeholder="Filter these routes — e.g. webhook, oauth, rate limit…" autocomplete="off" aria-label="Filter routes">
 <p id="none">No routes match. Try the <a href="/dashboard">semantic search on the dashboard</a> — keyword filtering here is exact-match only.</p>
 ${sections}
 <div style="background:var(--panel);border:1px solid var(--accent);border-radius:12px;padding:16px 20px;margin-top:24px;font-size:14px">Need one of these verified for <b>your</b> stack, or a ${t} route we don't have yet? <a href="https://buy.stripe.com/9B69AT9RsfKHcuZ6Wiao80f">Custom route — $25</a> · Teams: <a href="https://buy.stripe.com/3cI6oH7JkburgLf0xUao80h">Pilot — $750/mo</a> · <a href="https://waymark.network/pricing">all plans</a></div>
@@ -2935,6 +2998,10 @@ async function routePage(env: Env, id: string): Promise<Response> {
   let domainDrifted = false;
   try { domainDrifted = (await getDriftDomains(env)).has(r.domain.toLowerCase()); } catch { /* cosmetic */ }
 
+  // Item 85: if this provider has an in-depth guide, link it — the path from a
+  // route page (where search/playground users land) to the deep conversion page.
+  const guide = GUIDE_FOR_DOMAIN[r.domain.toLowerCase()];
+
   // Live corpus scale for the CTA. The old hardcoded "200+" was written at launch
   // and undercounted the corpus ~30× (6.4k routes) — a 30× under-claim on the most
   // shareable/indexable surface, and stale the moment a route is added. Derive it
@@ -3020,7 +3087,7 @@ footer{color:var(--dim);font-size:13px;margin-top:28px}
 <h1>${t}</h1>
 <div class="meta">domain: <b>${d}</b> · ${r.steps.length} steps · contributed by ${escapeHtml(r.contributor)}</div>
 <div class="vbadge v-${vStatus}"><span class="vp">${vProvenance}</span><span class="va">community attestations: ${r.attestations.success}✓ / ${r.attestations.failure}✗${attestPct !== null ? ` · ${attestPct}% success` : ""}${total > 0 ? ` · ${keyed} keyed / ${anon} anonymous` : ""}${total > 0 ? ` · effective trust ${Math.round(effectiveTrust(r) * 100)}% (evidence ${evidenceAgeDays(r)}d old · decays on a ${TRUST_HALF_LIFE_DAYS}-day half-life toward unrated)` : ""}</span></div>
-${domainDrifted ? `<div class="panel" style="border-left:3px solid var(--warn)"><h2 style="color:var(--warn)">This API has logged drift</h2><b>${d}</b> has changed in ways that broke documented routes before — agents on stale knowledge fail silently. <a href="https://mcp.waymark.network/drift#alerts">Get alerted when ${d} drifts again →</a></div>` : ""}<div class="panel"><h2>${stepsHeading}</h2><ol>${r.steps.map((s) => `<li>${escapeHtml(s)}</li>`).join("")}</ol></div>
+${domainDrifted ? `<div class="panel" style="border-left:3px solid var(--warn)"><h2 style="color:var(--warn)">This API has logged drift</h2><b>${d}</b> has changed in ways that broke documented routes before — agents on stale knowledge fail silently. <a href="https://mcp.waymark.network/drift#alerts">Get alerted when ${d} drifts again →</a></div>` : ""}${guide ? guidePanel(guide, d) : ""}<div class="panel"><h2>${stepsHeading}</h2><ol>${r.steps.map((s) => `<li>${escapeHtml(s)}</li>`).join("")}</ol></div>
 ${r.gotchas.length ? `<div class="panel g"><h2>Known gotchas</h2><ul>${r.gotchas.map((g) => `<li>${escapeHtml(g)}</li>`).join("")}</ul></div>` : ""}
 ${related.length ? `<div class="panel rel"><h2>Related routes</h2>${related.map((x) => {
     const xt = x.attestations.success + x.attestations.failure;
