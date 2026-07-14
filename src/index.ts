@@ -2748,6 +2748,7 @@ const GUIDE_FOR_DOMAIN: Record<string, { slug: string; title: string }> = {
   "hubspot.com": { slug: "hubspot-create-or-update-contact", title: "HubSpot: create or update a contact idempotently (upsert)" },
   "atlassian-jira": { slug: "jira-api-v3-adf-formatting", title: "Jira API v3 and ADF formatting" },
   "api-ca.metrc.com": { slug: "metrc-create-packages-from-harvest", title: "Create packages from a harvest in Metrc — endpoint, tag rules, and the 10-object cap" },
+  "mhi.org": { slug: "warehouse-pallet-rack-inspection-rmi", title: "Warehouse pallet rack inspection per RMI — lifecycle, frequency, and documentation" },
   "docs.oracle.com/en/cloud/saas/netsuite": { slug: "netsuite-suitetalk-auth", title: "NetSuite SuiteTalk REST authentication" },
   "netsuite": { slug: "netsuite-suitetalk-auth", title: "NetSuite SuiteTalk REST authentication" },
   "plaid.com": { slug: "plaid-webhook-verification", title: "Plaid webhook verification" },
