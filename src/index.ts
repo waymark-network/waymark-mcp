@@ -118,6 +118,12 @@ const tokenize = (s: string) =>
 type IdxEntry = Route;
 const INDEX_KEY = "idx:routes";
 
+/* IndexNow host-ownership key (item 87). Served at /{key}.txt on this worker AND
+ * as a static file on waymark.network — both hosts submit under the same key.
+ * Not a secret (the protocol requires it to be public); rotation is a normal
+ * code change, done on both hosts in the same run. */
+const INDEXNOW_KEY = "f312f24ca9740fdd9957142e30f44bb2";
+
 async function listAllRouteKeys(env: Env): Promise<string[]> {
   const keys: string[] = [];
   let cursor: string | undefined;
@@ -1972,6 +1978,18 @@ export default {
       return routePage(env, rest);
     }
     if (pathname === "/sitemap.xml") return sitemap(env);
+    // IndexNow key file (item 87) — proves host ownership to api.indexnow.org so
+    // run tooling can push URL updates into the Bing/Copilot/Yandex/Seznam/Naver
+    // index ecosystem (ChatGPT search + Copilot answers ride Bing's index — where
+    // agent developers search) instead of waiting passively for crawl. The same
+    // key file is served statically on waymark.network. The worker only HOSTS the
+    // key; submissions are one-shot POSTs from run tooling (tools/indexnow-submit.mjs).
+    // Rotating the key = update this const + the static site file together.
+    if (pathname === `/${INDEXNOW_KEY}.txt`) {
+      return new Response(INDEXNOW_KEY, {
+        headers: { "Content-Type": "text/plain", "Cache-Control": "public, max-age=86400" },
+      });
+    }
     if (pathname === "/robots.txt") {
       // Every indexable HTML surface (/r/{id}, /routes, /routes/{slug}, /dashboard,
       // /drift, /contributors) AND the JSON/data endpoints (advertised in /llms.txt
