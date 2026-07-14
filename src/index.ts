@@ -135,6 +135,17 @@ async function listAllRouteKeys(env: Env): Promise<string[]> {
   return keys;
 }
 
+/* Cloudflare KV hard value cap. idx:routes hit this on 2026-07-14 at 15,236
+ * routes (26,214,350 bytes — see REPORT-2026-07-14-index-cap.md): any index
+ * PUT beyond it rejects, which previously surfaced as an unhandled 1101 on
+ * /admin/merge-index and a silent drop in patchIndex. Every INDEX_KEY writer
+ * below now (a) pre-checks payload.length (ASCII lower bound on bytes — a
+ * length over the cap is definitely over; the try/catch stays as the exact
+ * backstop for multi-byte payloads under-length but over-bytes) and (b)
+ * degrades explicitly instead of crashing. This is a GUARD, not the fix —
+ * the index redesign (slim/shard/R2) is Daniel-gated. */
+const KV_VALUE_CAP_BYTES = 26_214_400; // 25 MiB
+
 async function buildIndex(env: Env): Promise<IdxEntry[]> {
   const keys = await listAllRouteKeys(env);
   const entries: IdxEntry[] = [];
@@ -146,7 +157,16 @@ async function buildIndex(env: Env): Promise<IdxEntry[]> {
       entries.push(r);
     }
   }
-  await env.ROUTES.put(INDEX_KEY, JSON.stringify(entries));
+  // Persist is best-effort: at current corpus scale the serialized index can
+  // exceed the KV value cap, and a rebuild triggered from a READ path must
+  // never throw — serve the in-memory copy either way.
+  try {
+    const payload = JSON.stringify(entries);
+    if (payload.length <= KV_VALUE_CAP_BYTES) await env.ROUTES.put(INDEX_KEY, payload);
+    else console.error(`buildIndex: not persisting idx:routes — ${payload.length} chars exceeds KV cap ${KV_VALUE_CAP_BYTES}`);
+  } catch (e) {
+    console.error("buildIndex: idx:routes PUT failed, serving in-memory copy", e);
+  }
   return entries;
 }
 
@@ -156,12 +176,25 @@ async function getIndex(env: Env): Promise<IdxEntry[]> {
   return buildIndex(env);
 }
 
-/** Best-effort index mutation (alpha: last-writer-wins is acceptable). */
-async function patchIndex(env: Env, fn: (idx: IdxEntry[]) => IdxEntry[]): Promise<void> {
+/** Best-effort index mutation (alpha: last-writer-wins is acceptable).
+ * Returns true if the served index was actually updated, false if the write
+ * was dropped (KV value cap or any other PUT failure) — callers that owe the
+ * user honesty (contribute) surface the false; callers where a stale index
+ * copy is tolerable (attest counters) may ignore it. */
+async function patchIndex(env: Env, fn: (idx: IdxEntry[]) => IdxEntry[]): Promise<boolean> {
   try {
     const idx = await getIndex(env);
-    await env.ROUTES.put(INDEX_KEY, JSON.stringify(fn(idx)));
-  } catch { /* rebuildable */ }
+    const payload = JSON.stringify(fn(idx));
+    if (payload.length > KV_VALUE_CAP_BYTES) {
+      console.error(`patchIndex: dropped — ${payload.length} chars exceeds KV cap ${KV_VALUE_CAP_BYTES} (index at capacity, see REPORT-2026-07-14-index-cap.md)`);
+      return false;
+    }
+    await env.ROUTES.put(INDEX_KEY, payload);
+    return true;
+  } catch (e) {
+    console.error("patchIndex: dropped — idx:routes PUT failed", e);
+    return false;
+  }
 }
 
 /** Per-isolate memo of the corpus scale (total routes + distinct domains).
@@ -504,7 +537,25 @@ async function mergeIndex(env: Env, key: string | null, request: Request): Promi
   const byId = new Map(idx.map((e) => [e.id, e] as const));
   let added = 0, updated = 0;
   for (const r of routes) { byId.has(r.id) ? updated++ : added++; byId.set(r.id, r); }
-  await env.ROUTES.put(INDEX_KEY, JSON.stringify([...byId.values()]));
+  // Capacity guard (2026-07-14): an over-cap PUT here previously threw an
+  // unhandled 1101 mid-run (factory run 97). Fail as an explicit 507 the
+  // caller can branch on; the submitted routes' bodies + vectors are already
+  // stored and the ids stay idempotent to re-merge after the index redesign.
+  const payload = JSON.stringify([...byId.values()]);
+  const atCapacity = (detail: string) => Response.json({
+    error: "index_at_capacity",
+    detail,
+    index_chars: payload.length,
+    kv_value_cap_bytes: KV_VALUE_CAP_BYTES,
+    index_total_attempted: byId.size,
+    note: "Route bodies + vectors for the submitted ids are stored; ids are idempotent to re-merge once the index redesign ships (REPORT-2026-07-14-index-cap.md). Do NOT retry in a loop.",
+  }, { status: 507 });
+  if (payload.length > KV_VALUE_CAP_BYTES) return atCapacity("idx:routes payload exceeds Cloudflare KV's 25 MiB value cap; merge refused before PUT.");
+  try {
+    await env.ROUTES.put(INDEX_KEY, payload);
+  } catch (e) {
+    return atCapacity(`idx:routes PUT rejected by KV: ${e instanceof Error ? e.message : String(e)}`);
+  }
   return Response.json({ merged: routes.length, added, updated, missing, index_total: byId.size });
 }
 
@@ -532,7 +583,14 @@ async function migrateVerification(env: Env, key: string | null, request: Reques
     const idx = await getIndex(env);
     let stamped = 0;
     for (const e of idx) { if (!e.verification) { e.verification = stamp; stamped++; } }
-    await env.ROUTES.put(INDEX_KEY, JSON.stringify(idx));
+    // Same capacity guard as mergeIndex: explicit 507 over an unhandled 1101.
+    const payload = JSON.stringify(idx);
+    if (payload.length > KV_VALUE_CAP_BYTES) return Response.json({ error: "index_at_capacity", detail: "idx:routes payload exceeds the KV 25 MiB value cap; stamp not persisted (see REPORT-2026-07-14-index-cap.md).", index_chars: payload.length, kv_value_cap_bytes: KV_VALUE_CAP_BYTES }, { status: 507 });
+    try {
+      await env.ROUTES.put(INDEX_KEY, payload);
+    } catch (e) {
+      return Response.json({ error: "index_at_capacity", detail: `idx:routes PUT rejected by KV: ${e instanceof Error ? e.message : String(e)}`, index_chars: payload.length, kv_value_cap_bytes: KV_VALUE_CAP_BYTES }, { status: 507 });
+    }
     return Response.json({ target, total: idx.length, stamped });
   }
 
@@ -785,7 +843,12 @@ export class WaymarkMCP extends McpAgent<Env> {
           verification: { status: "unverified", method: isAdmin ? "operator-contrib" : "community-contrib", at: nowIso },
         };
         await env.ROUTES.put(`route:${id}`, JSON.stringify(route));
-        await patchIndex(env, (idx) => [...idx, route]);
+        // At the KV index cap this write is dropped (patchIndex → false): the
+        // route body + vector below still land, so the route IS servable via
+        // semantic query and /r/{id} — it's only absent from index-driven
+        // surfaces (/routes, sitemap, /stats count) until the redesign merges
+        // it. Tell the contributor the truth instead of silently orphaning.
+        const indexed = await patchIndex(env, (idx) => [...idx, route]);
         await upsertVector(env, route);
         if (keyRec) {
           keyRec.rec.contributions++;
@@ -799,8 +862,9 @@ export class WaymarkMCP extends McpAgent<Env> {
           contributor: handle,
           steps: steps.length,
           src,
+          ...(indexed ? {} : { index_deferred: true }),
         });
-        return { content: [{ type: "text" as const, text: JSON.stringify({ route_id: id, status: "accepted", credits_earned: 1 }) }] };
+        return { content: [{ type: "text" as const, text: JSON.stringify({ route_id: id, status: "accepted", credits_earned: 1, ...(indexed ? {} : { note: "Route stored and queryable, but the browse index is temporarily at capacity — it will appear in /routes listings after the next index rebuild. No action needed; do not resubmit." }) }) }] };
       }
     );
 
@@ -2070,7 +2134,13 @@ function notFound(request: Request, pathname: string): Response {
 /** Public stats for the landing-page counters (CORS-open, cacheable 60s, ETag revalidation). */
 async function stats(request: Request, env: Env): Promise<Response> {
   try {
-    const routes = await getIndex(env);
+    // Read raw (not via getIndex) so capacity is observable: index_chars is a
+    // lower bound on the value's bytes (exact for ASCII). Surfacing this makes
+    // the 2026-07-14 at-capacity freeze visible on the ops surface every run
+    // checks, instead of only in a report file.
+    const raw = await env.ROUTES.get(INDEX_KEY);
+    const routes: IdxEntry[] = raw ? JSON.parse(raw) : await buildIndex(env);
+    const indexChars = raw ? raw.length : null;
     const attestations = routes.reduce((n, r) => n + r.attestations.success + r.attestations.failure, 0);
     const queries = parseInt((await env.ROUTES.get("counter:queries")) ?? "0", 10);
     // Counter-based events_30d: sum ≤31 per-day counters (see logEvent).
@@ -2080,7 +2150,14 @@ async function stats(request: Request, env: Env): Promise<Response> {
     const recent = dayKeys.filter((k) => k.slice(8) >= cutoff);
     const vals = await Promise.all(recent.map((k) => env.ROUTES.get(k)));
     const events = vals.reduce((n, v) => n + (parseInt(v ?? "0", 10) || 0), 0);
-    const body = JSON.stringify({ routes: routes.length, attestations, queries, events_30d: events });
+    const body = JSON.stringify({
+      routes: routes.length, attestations, queries, events_30d: events,
+      // Additive fields (2026-07-14): index capacity telemetry. index_capacity_pct
+      // ≥100 means idx:routes writes are being refused/dropped (network frozen —
+      // see REPORT-2026-07-14-index-cap.md); redesign decision is Daniel-gated.
+      index_chars: indexChars,
+      index_capacity_pct: indexChars === null ? null : Math.round((indexChars / KV_VALUE_CAP_BYTES) * 1000) / 10,
+    });
     return conditional(request, body, await etagOf(body), {
       ...CORS, "Content-Type": "application/json", "Cache-Control": "public, max-age=60",
     });
