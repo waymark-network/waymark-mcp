@@ -2017,11 +2017,32 @@ export default {
       });
     }
     if (pathname === "/search") {
-      const q = searchParams.get("q") ?? "";
+      const qParam = searchParams.get("q") ?? "";
       // probe=1: our own smoke/eval/build tooling self-identifies so demand
       // telemetry can separate human playground queries from our probes.
       const isProbe = searchParams.get("probe") === "1";
-      return withServiceDesc(searchEndpoint(env, request, q, ctx, isProbe));
+      // Moment-of-intent leak fix (revenue backlog #2, 2026-07-15): ?q= is the
+      // documented GET form, but many developers reflexively POST a JSON body to
+      // a search endpoint. That previously fell through to searchEndpoint with an
+      // empty q → the bare `{routes:[]}` early return → NO zero-result $25 CTA,
+      // silently losing the highest-intent buyer (a real query that matched
+      // nothing IS the demand signal). Accept {query|q|task} from a POST body so
+      // that habit hits the same retrieval + bounty-CTA path. `dispatch` is
+      // synchronous, so read the body via a .then() chain (no await) — GET ?q
+      // stays canonical; a non-JSON/empty body just leaves q blank as before.
+      if (!qParam.trim() && request.method === "POST") {
+        return withServiceDesc(
+          request.json().then(
+            (pb) => {
+              const b = (pb ?? {}) as { query?: unknown; q?: unknown; task?: unknown };
+              const q = String(b.query ?? b.q ?? b.task ?? "").trim();
+              return searchEndpoint(env, request, q, ctx, isProbe);
+            },
+            () => searchEndpoint(env, request, "", ctx, isProbe),
+          ),
+        );
+      }
+      return withServiceDesc(searchEndpoint(env, request, qParam, ctx, isProbe));
     }
     if (pathname === "/admin/merge-index" && request.method === "POST") {
       return mergeIndex(env, request.headers.get("x-write-key"), request);
@@ -2905,7 +2926,7 @@ async function routeDomainPage(env: Env, slugRaw: string): Promise<Response> {
     const n = r.attestations.success + r.attestations.failure;
     return n > 0 ? Math.round((r.attestations.success / n) * 100) + "% success" : "unrated";
   };
-  const desc = `${total} agent route${total === 1 ? "" : "s"} for ${title} on the Waymark knowledge network — step sequences, known gotchas, and consensus trust scores.`;
+  const desc = `Integrate ${title} with AI agents — ${total} documented route${total === 1 ? "" : "s"} covering the step sequences, auth scopes, and known gotchas that trip up AI agents on ${title}, each trust-scored by agent-execution consensus. From the Waymark agent knowledge network.`;
   const breadcrumbLd = {
     "@context": "https://schema.org", "@type": "BreadcrumbList",
     itemListElement: [
@@ -2913,6 +2934,27 @@ async function routeDomainPage(env: Env, slugRaw: string): Promise<Response> {
       { "@type": "ListItem", position: 2, name: "Routes", item: "https://mcp.waymark.network/routes" },
       { "@type": "ListItem", position: 3, name: title, item: pageUrl },
     ],
+  };
+  // Item 95: CollectionPage + ItemList so search engines read this hub as a
+  // structured collection of the domain's routes (topical-relevance + rich-result
+  // signal for "<provider> agent integration" buyer searches). Bounded to 100
+  // items to keep the JSON-LD small even for the largest domain (~125 routes).
+  const allRoutes = domainNames.flatMap((d) => matched.get(d)!);
+  const collectionLd = {
+    "@context": "https://schema.org", "@type": "CollectionPage",
+    name: `${title} — AI agent integration routes`,
+    url: pageUrl,
+    description: desc,
+    isPartOf: { "@type": "WebSite", name: "Waymark", url: "https://waymark.network" },
+    mainEntity: {
+      "@type": "ItemList",
+      numberOfItems: total,
+      itemListElement: allRoutes.slice(0, 100).map((r, i) => ({
+        "@type": "ListItem", position: i + 1,
+        url: `https://mcp.waymark.network/r/${r.id}`,
+        name: r.task,
+      })),
+    },
   };
   const sections = domainNames.map((d) => {
     const rs = matched.get(d)!;
@@ -2925,12 +2967,12 @@ async function routeDomainPage(env: Env, slugRaw: string): Promise<Response> {
 
   const html = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${t} — ${total} agent route${total === 1 ? "" : "s"} | Waymark</title>
+<title>${t} — AI agent integration: ${total} route${total === 1 ? "" : "s"} with steps + gotchas | Waymark</title>
 <meta name="description" content="${escapeHtml(desc)}">
 <link rel="canonical" href="${pageUrl}">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="Waymark">
-<meta property="og:title" content="${t} — agent routes">
+<meta property="og:title" content="${t} — AI agent integration routes">
 <meta property="og:description" content="${escapeHtml(desc)}">
 <meta property="og:url" content="${pageUrl}">
 <meta property="og:image" content="https://waymark.network/og.png">
@@ -2941,12 +2983,13 @@ async function routeDomainPage(env: Env, slugRaw: string): Promise<Response> {
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:image" content="https://waymark.network/og.png">
 <meta name="twitter:image:alt" content="waymark — the collective intelligence network for AI agents">
-<meta name="twitter:title" content="${t} — agent routes | Waymark">
+<meta name="twitter:title" content="${t} — AI agent integration routes | Waymark">
 <meta name="twitter:description" content="${escapeHtml(desc)}">
 <link rel="icon" type="image/png" sizes="32x32" href="https://waymark.network/favicon-32.png">
 <link rel="icon" type="image/png" sizes="16x16" href="https://waymark.network/favicon-16.png">
 <link rel="apple-touch-icon" href="https://waymark.network/apple-touch-icon.png">
 <script type="application/ld+json">${jsonLdSafe(breadcrumbLd)}</script>
+<script type="application/ld+json">${jsonLdSafe(collectionLd)}</script>
 <style>:root{--bg:#0b0e14;--panel:#131826;--line:#1f2840;--text:#e6ebf4;--dim:#8b96ad;--accent:#5eead4;--warn:#fbbf24;--good:#34d399}
 *{box-sizing:border-box;margin:0}body{background:var(--bg);color:var(--text);font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:860px;margin:0 auto;padding:24px}
 a{color:var(--accent)}h1{font-size:26px;line-height:1.3;margin:18px 0 6px}.meta{color:var(--dim);font-size:14px;margin-bottom:20px}
@@ -3078,8 +3121,18 @@ async function routePage(env: Env, id: string): Promise<Response> {
     : vStatus === "unverified"
     ? "Community-contributed — not yet independently checked"
     : "Sampled — shipped under file-level sampling, not individually fact-checked";
-  const titleKind = vStatus === "verified" ? "verified agent route" : vStatus === "unverified" ? "community agent route" : "agent route";
   const descKind = vStatus === "verified" ? "Verified procedural route" : vStatus === "unverified" ? "Community-contributed procedural route" : "Procedural route";
+  // Search-intent title (backlog item 1): developers search "<task> <api/domain>"
+  // and "<x> gotchas/steps" — never the phrase "agent route". Lead the title with
+  // task + the DOMAIN keyword, then the concrete payload (steps + gotchas) that
+  // both matches long-tail queries and earns the click. The verification status
+  // stays honest in the visible badge + description, not stuffed into the title.
+  const gotchaN = r.gotchas.length;
+  const titleTail = gotchaN
+    ? `${d}: ${r.steps.length} steps + ${gotchaN} gotcha${gotchaN === 1 ? "" : "s"}`
+    : `${d}: ${r.steps.length} step${r.steps.length === 1 ? "" : "s"}`;
+  const pageTitle = `${t} — ${titleTail} | Waymark`;
+  const socialTitle = `${t} — ${titleTail}`;
   const stepsHeading = vStatus === "verified" ? "Verified steps" : vStatus === "unverified" ? "Documented steps" : "Steps";
   const attestSummary = total > 0 ? `${attestPct}% success across ${total} agent attestation${total === 1 ? "" : "s"}` : "no community attestations yet";
 
@@ -3117,7 +3170,8 @@ async function routePage(env: Env, id: string): Promise<Response> {
     }
   } catch { /* fall back to the durable "thousands more" phrasing */ }
 
-  const desc = `${descKind} for: ${t}. ${r.steps.length} steps, ${r.gotchas.length} known gotchas. Provenance: ${vWord}; ${attestSummary}. From the Waymark agent knowledge network.`;
+  const gotchaPhrase = gotchaN ? ` and ${gotchaN} known gotcha${gotchaN === 1 ? "" : "s"} that trip up AI agents` : "";
+  const desc = `${t} on ${d} — ${r.steps.length} documented step${r.steps.length === 1 ? "" : "s"}${gotchaPhrase}. ${descKind}; provenance ${vWord}; ${attestSummary}. From the Waymark agent knowledge network.`;
   const pageUrl = `https://mcp.waymark.network/r/${r.id}`;
   const jsonLd = {
     "@context": "https://schema.org", "@type": "HowTo", name: r.task,
@@ -3137,13 +3191,13 @@ async function routePage(env: Env, id: string): Promise<Response> {
   };
   const html = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${t} — ${titleKind} | Waymark</title>
+<title>${pageTitle}</title>
 <meta name="description" content="${desc}">
 ${isSyntheticTraffic(r.domain) ? `<meta name="robots" content="noindex">\n` : ""}<link rel="canonical" href="${pageUrl}">
 <link rel="alternate" type="application/json" title="This route as JSON" href="${pageUrl}.json">
 <meta property="og:type" content="article">
 <meta property="og:site_name" content="Waymark">
-<meta property="og:title" content="${t} — ${titleKind}">
+<meta property="og:title" content="${socialTitle}">
 <meta property="og:description" content="${desc}">
 <meta property="og:url" content="${pageUrl}">
 <meta property="og:image" content="https://waymark.network/og.png">
@@ -3154,7 +3208,7 @@ ${isSyntheticTraffic(r.domain) ? `<meta name="robots" content="noindex">\n` : ""
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:image" content="https://waymark.network/og.png">
 <meta name="twitter:image:alt" content="waymark — the collective intelligence network for AI agents">
-<meta name="twitter:title" content="${t} — ${titleKind} | Waymark">
+<meta name="twitter:title" content="${pageTitle}">
 <meta name="twitter:description" content="${desc}">
 <link rel="icon" type="image/png" sizes="32x32" href="https://waymark.network/favicon-32.png">
 <link rel="icon" type="image/png" sizes="16x16" href="https://waymark.network/favicon-16.png">
@@ -3321,6 +3375,27 @@ function openApiSpec(env: Env) {
                 } },
               } } } },
             },
+          },
+        },
+        post: {
+          operationId: "searchPost",
+          summary: "Semantic route search (JSON body)",
+          description:
+            "Same retrieval as `GET /search?q=` for callers that prefer to POST a body. " +
+            "Send `{\"query\":\"…\"}` (aliases: `q`, `task`). Zero-result responses carry the same " +
+            "`note` + `request_route` ($25 bounty) fields. `verified_only`/`probe` still go in the query string.",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: { type: "object", required: ["query"], properties: {
+              query: { type: "string", maxLength: 256, description: "Natural-language task description. Aliases: `q`, `task`." },
+            } } } },
+          },
+          responses: {
+            "200": { description: "Same shape as GET /search — ranked routes, or an empty list plus the $25 bounty CTA on a no-match query.", content: { "application/json": { schema: { type: "object", required: ["routes"], properties: {
+              routes: { type: "array", items: { $ref: "#/components/schemas/RouteResult" } },
+              note: { type: "string" },
+              request_route: { type: "object", properties: { what: { type: "string" }, price_usd: { type: "number", const: 25 }, url: { type: "string", format: "uri" }, checkout: { type: "string", format: "uri" } } },
+            } } } } },
           },
         },
       },
