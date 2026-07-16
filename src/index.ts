@@ -115,8 +115,40 @@ const tokenize = (s: string) =>
  * bge embeddings — see below); this keyword index serves only when the
  * vector store is empty/unavailable. */
 
-type IdxEntry = Route;
+/* Slim index entry (2026-07-16, SPEC-2026-07-15-index-slim-migration): idx:routes
+ * previously stored full Route objects (~1.72 KB/entry) and hit KV's hard 25 MiB
+ * value cap at 15,236 routes, freezing all publishing. The index only needs the
+ * fields its read paths actually touch — ranking (task/domain + trust inputs),
+ * /stats + /contributors + /freshness aggregations (attestations, verification,
+ * created), and browse surfaces (step/gotcha COUNTS, never bodies). Full bodies
+ * stay in route:{id} (source of truth) and are fetched on demand top-k. ~350 B
+ * per entry ⇒ ~5x headroom at the current corpus, and the heavy per-route text
+ * no longer scales the index. */
+type IdxEntry = {
+  id: string;
+  task: string;
+  domain: string;
+  contributor: string;
+  created: string;
+  steps: number;   // count only — bodies live in route:{id}
+  gotchas: number; // count only — bodies live in route:{id}
+  attestations: Route["attestations"];
+  verification?: Route["verification"];
+};
+const toIdxEntry = (r: Route): IdxEntry => ({
+  id: r.id, task: r.task, domain: r.domain, contributor: r.contributor, created: r.created,
+  steps: r.steps.length, gotchas: r.gotchas.length,
+  attestations: r.attestations, verification: r.verification,
+});
+/** Back-compat: a fat (pre-slim) idx:routes value parses with steps as string[].
+ * Normalize on read so every consumer sees slim entries even before the one-time
+ * /admin/rebuild-index migration has run. */
+const normalizeIdx = (arr: unknown[]): IdxEntry[] =>
+  arr.length > 0 && Array.isArray((arr[0] as { steps?: unknown })?.steps)
+    ? (arr as Route[]).map(toIdxEntry)
+    : (arr as IdxEntry[]);
 const INDEX_KEY = "idx:routes";
+const INDEX_STAGING_KEY = "idx:routes:rebuild"; // staging value for the cursored rebuild; swapped in atomically on completion
 
 /* IndexNow host-ownership key (item 87). Served at /{key}.txt on this worker AND
  * as a static file on waymark.network — both hosts submit under the same key.
@@ -154,7 +186,7 @@ async function buildIndex(env: Env): Promise<IdxEntry[]> {
     for (const v of chunk) {
       if (!v) continue;
       const r: Route = JSON.parse(v);
-      entries.push(r);
+      entries.push(toIdxEntry(r));
     }
   }
   // Persist is best-effort: at current corpus scale the serialized index can
@@ -172,7 +204,7 @@ async function buildIndex(env: Env): Promise<IdxEntry[]> {
 
 async function getIndex(env: Env): Promise<IdxEntry[]> {
   const raw = await env.ROUTES.get(INDEX_KEY);
-  if (raw) return JSON.parse(raw);
+  if (raw) return normalizeIdx(JSON.parse(raw));
   return buildIndex(env);
 }
 
@@ -243,16 +275,19 @@ const bigrams = (tokens: string[]) => {
  * shown NEXT TO the evidence, not instead of it). Freshness is clamped at 1
  * so a clock-skewed lastAt can never inflate trust above its raw value. */
 const TRUST_HALF_LIFE_DAYS = 60; // matches /drift half_life_days — one constant, one story
-const attestationFreshness = (r: Route, now = Date.now()): number =>
+/* Trust helpers take the attestation shape (not full Route) so they serve both
+ * full route bodies AND slim index entries. */
+type Attested = { attestations: Route["attestations"] };
+const attestationFreshness = (r: Attested, now = Date.now()): number =>
   r.attestations.lastAt
     ? Math.min(1, Math.pow(0.5, (now - new Date(r.attestations.lastAt).getTime()) / (TRUST_HALF_LIFE_DAYS * 86400_000)))
     : 1; // never attested ⇒ laplace already sits at the prior; nothing to decay
-const effectiveTrust = (r: Route, now = Date.now()): number => {
+const effectiveTrust = (r: Attested, now = Date.now()): number => {
   const a = r.attestations;
   const laplace = (a.success + 1) / (a.success + a.failure + 2);
   return 0.5 + (laplace - 0.5) * attestationFreshness(r, now);
 };
-const evidenceAgeDays = (r: Route): number | null =>
+const evidenceAgeDays = (r: Attested): number | null =>
   r.attestations.lastAt
     ? Math.max(0, Math.round((Date.now() - new Date(r.attestations.lastAt).getTime()) / 86400_000))
     : null;
@@ -536,7 +571,7 @@ async function mergeIndex(env: Env, key: string | null, request: Request): Promi
   const idx = await getIndex(env);
   const byId = new Map(idx.map((e) => [e.id, e] as const));
   let added = 0, updated = 0;
-  for (const r of routes) { byId.has(r.id) ? updated++ : added++; byId.set(r.id, r); }
+  for (const r of routes) { byId.has(r.id) ? updated++ : added++; byId.set(r.id, toIdxEntry(r)); }
   // Capacity guard (2026-07-14): an over-cap PUT here previously threw an
   // unhandled 1101 mid-run (factory run 97). Fail as an explicit 507 the
   // caller can branch on; the submitted routes' bodies + vectors are already
@@ -557,6 +592,80 @@ async function mergeIndex(env: Env, key: string | null, request: Request): Promi
     return atCapacity(`idx:routes PUT rejected by KV: ${e instanceof Error ? e.message : String(e)}`);
   }
   return Response.json({ merged: routes.length, added, updated, missing, index_total: byId.size });
+}
+
+/** WRITE_KEY-gated cursored rebuild of idx:routes from route:{id} bodies (the
+ * source of truth), projected to slim IdxEntry shape (SPEC-2026-07-15).
+ *
+ * WHY CURSORED: a one-shot rebuild needs ~15k KV gets — over the Workers
+ * per-request subrequest limit (same discipline as migrateVerification's
+ * ?target=routes). Each call processes ≤`limit` route keys (default 500,
+ * 1 list + N gets + ≤2 puts per call) and accumulates into a STAGING key, so
+ * the live index keeps serving untouched until the final call swaps the
+ * completed staging value in atomically. Idempotent per-id (last write wins by
+ * route id), safe to re-run from scratch with ?reset=1.
+ *
+ * Loop until done=true:
+ *   POST /admin/rebuild-index            — first call (or resume)
+ *   POST /admin/rebuild-index?cursor=... — subsequent calls with returned cursor
+ * On the final page the staging value is copied to idx:routes and staging is
+ * cleared. Space calls ~1s apart (KV read-after-write on the staging key). */
+async function rebuildIndex(env: Env, key: string | null, request: Request): Promise<Response> {
+  if (key !== env.WRITE_KEY) return new Response("forbidden", { status: 403 });
+  const url = new URL(request.url);
+  const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") ?? "500", 10) || 500, 1), 800);
+  const cursor = url.searchParams.get("cursor") || undefined;
+  const reset = ["1", "true"].includes(url.searchParams.get("reset") ?? "");
+  // Resume state: staging holds the slim entries accumulated so far. A fresh
+  // start (no cursor, or ?reset=1) begins empty.
+  const prior: IdxEntry[] = (cursor && !reset)
+    ? (JSON.parse((await env.ROUTES.get(INDEX_STAGING_KEY)) ?? "[]") as IdxEntry[])
+    : [];
+  const byId = new Map(prior.map((e) => [e.id, e] as const));
+  const page = await env.ROUTES.list({ prefix: "route:", limit, cursor });
+  const names = page.keys.map((k) => k.name);
+  for (let i = 0; i < names.length; i += 100) {
+    const chunk = await Promise.all(names.slice(i, i + 100).map((n) => env.ROUTES.get(n)));
+    for (const v of chunk) {
+      if (!v) continue;
+      const e = toIdxEntry(JSON.parse(v) as Route);
+      byId.set(e.id, e);
+    }
+  }
+  const entries = [...byId.values()];
+  const payload = JSON.stringify(entries);
+  if (payload.length > KV_VALUE_CAP_BYTES) {
+    return Response.json({
+      error: "index_at_capacity",
+      detail: "Slim index still exceeds the KV 25 MiB value cap — corpus has outgrown even the slim shape; escalate to shard/R2 (REPORT-2026-07-14-index-cap.md).",
+      index_chars: payload.length, kv_value_cap_bytes: KV_VALUE_CAP_BYTES,
+    }, { status: 507 });
+  }
+  const done = page.list_complete;
+  try {
+    if (done) {
+      // Final page: swap the completed staging value into the live key, then
+      // clear staging. The live index is replaced in ONE put — no partial serve.
+      await env.ROUTES.put(INDEX_KEY, payload);
+      await env.ROUTES.delete(INDEX_STAGING_KEY);
+    } else {
+      await env.ROUTES.put(INDEX_STAGING_KEY, payload);
+    }
+  } catch (e) {
+    return Response.json({
+      error: "index_put_failed",
+      detail: e instanceof Error ? e.message : String(e),
+      index_chars: payload.length,
+    }, { status: 507 });
+  }
+  return Response.json({
+    done,
+    processed_this_call: names.length,
+    total_entries: entries.length,
+    index_chars: payload.length,
+    capacity_pct: Math.round((payload.length / KV_VALUE_CAP_BYTES) * 1000) / 10,
+    cursor: done ? null : page.cursor,
+  });
 }
 
 /** WRITE_KEY-gated verification-provenance backfill. Stamps a `verification`
@@ -634,6 +743,43 @@ async function migrateVerification(env: Env, key: string | null, request: Reques
 const NO_RESULT_CTA =
   "No verified route for this yet — request one authored + verified for your stack in 24h: " +
   "https://waymark.network/pricing (custom route, $25).";
+
+/* Moment-of-intent conversion (revenue backlog #2, 2026-07-14): a *match the
+ * caller can't trust* is itself a buy signal — the second-highest-intent moment
+ * after a true zero-result. When retrieval returns relevant routes but NONE are
+ * independently verified and the best *decayed* trust is still near the neutral
+ * prior (< LOW_CONF_TRUST), attach the $25 verification bounty ADDITIVELY.
+ * Consumers that read only `routes` are byte-unaffected; proven routes
+ * (verified, or trust ≥ threshold from real consensus) are never nagged. Honest
+ * by construction: the only claim made is "not independently verified for your
+ * stack," which is exactly what verification:"sampled" + a near-prior trust
+ * score mean. Shared by waymark_query (MCP) and /search (HTTP). */
+const LOW_CONF_TRUST = 0.7;
+// `verification` is a union across corpus vintages: a bare string ("verified" |
+// "sampled") on legacy rows, or an object { status } on newer ones. Treat BOTH
+// forms as verified so the CTA never falsely claims "none are verified" when a
+// verified route is in the set (an honesty bug, not just a UX one).
+const isVerified = (v: unknown): boolean =>
+  v === "verified" ||
+  (typeof v === "object" && v !== null && (v as { status?: string }).status === "verified");
+const lowConfidenceUpsell = (
+  ranked: ReadonlyArray<{ effective_trust?: number; verification?: unknown }>,
+): { verify_cta: { what: string; price_usd: 25; url: string; checkout: string } } | null => {
+  if (ranked.length === 0) return null;
+  if (ranked.some((r) => isVerified(r.verification))) return null;
+  const topTrust = Math.max(...ranked.map((r) => r.effective_trust ?? 0));
+  if (topTrust >= LOW_CONF_TRUST) return null;
+  return {
+    verify_cta: {
+      what:
+        "These routes match your task but none are independently verified for your exact stack yet. " +
+        "Commission a fact-checked, live-tested verified route ($25 bounty — we research it, run it against the live API, and publish it).",
+      price_usd: 25,
+      url: "https://waymark.network/pricing",
+      checkout: "https://buy.stripe.com/9B69AT9RsfKHcuZ6Wiao80f",
+    },
+  };
+};
 
 export class WaymarkMCP extends McpAgent<Env> {
   server = new McpServer({ name: "waymark", version: "0.2.0" });
@@ -741,6 +887,7 @@ export class WaymarkMCP extends McpAgent<Env> {
                   ? JSON.stringify({
                       routes: ranked,
                       ...(proKey ? { verified_only: true, credits_remaining: creditsRemaining } : {}),
+                      ...(lowConfidenceUpsell(ranked) ?? {}),
                       trust_decay: {
                         half_life_days: TRUST_HALF_LIFE_DAYS,
                         model: "effective_trust = 0.5 + (laplace(success,failure) - 0.5) * 0.5^(days_since_last_attestation/60) — attestation weight reverts toward the neutral prior as evidence ages; raw tallies are never hidden.",
@@ -848,7 +995,7 @@ export class WaymarkMCP extends McpAgent<Env> {
         // semantic query and /r/{id} — it's only absent from index-driven
         // surfaces (/routes, sitemap, /stats count) until the redesign merges
         // it. Tell the contributor the truth instead of silently orphaning.
-        const indexed = await patchIndex(env, (idx) => [...idx, route]);
+        const indexed = await patchIndex(env, (idx) => [...idx, toIdxEntry(route)]);
         await upsertVector(env, route);
         if (keyRec) {
           keyRec.rec.contributions++;
@@ -941,7 +1088,7 @@ export class WaymarkMCP extends McpAgent<Env> {
         }
         route.attestations.lastAt = new Date().toISOString();
         await env.ROUTES.put(`route:${route_id}`, JSON.stringify(route));
-        await patchIndex(env, (idx) => idx.map((e) => (e.id === route_id ? route : e)));
+        await patchIndex(env, (idx) => idx.map((e) => (e.id === route_id ? toIdxEntry(route) : e)));
         await logEvent(env, "attest", {
           route_id,
           outcome,
@@ -2050,6 +2197,9 @@ export default {
     if (pathname === "/admin/backfill-vectors" && request.method === "POST") {
       return backfillVectors(env, request.headers.get("x-write-key"), searchParams.get("since"));
     }
+    if (pathname === "/admin/rebuild-index" && request.method === "POST") {
+      return rebuildIndex(env, request.headers.get("x-write-key"), request);
+    }
     if (pathname === "/admin/migrate-verification" && request.method === "POST") {
       return migrateVerification(env, request.headers.get("x-write-key"), request);
     }
@@ -2160,7 +2310,7 @@ async function stats(request: Request, env: Env): Promise<Response> {
     // the 2026-07-14 at-capacity freeze visible on the ops surface every run
     // checks, instead of only in a report file.
     const raw = await env.ROUTES.get(INDEX_KEY);
-    const routes: IdxEntry[] = raw ? JSON.parse(raw) : await buildIndex(env);
+    const routes: IdxEntry[] = raw ? normalizeIdx(JSON.parse(raw)) : await buildIndex(env);
     const indexChars = raw ? raw.length : null;
     const attestations = routes.reduce((n, r) => n + r.attestations.success + r.attestations.failure, 0);
     const queries = parseInt((await env.ROUTES.get("counter:queries")) ?? "0", 10);
@@ -2591,8 +2741,8 @@ async function routesEndpoint(request: Request, env: Env): Promise<Response> {
       id: r.id,
       task: r.task,
       domain: r.domain,
-      steps: r.steps.length,
-      gotchas: r.gotchas.length,
+      steps: r.steps,   // slim index stores counts (2026-07-16)
+      gotchas: r.gotchas,
       contributor: r.contributor,
       created: r.created,
       success: r.attestations.success,
@@ -2725,7 +2875,7 @@ async function searchEndpoint(env: Env, request: Request, q: string, ctx: Execut
   // $25 bounty is the live, shipping intake (v0.7 route requests + /pricing).
   const body: Record<string, unknown> =
     (ranked as unknown[]).length > 0
-      ? { routes: ranked }
+      ? { routes: ranked, ...(lowConfidenceUpsell(ranked as ReadonlyArray<{ effective_trust?: number; verification?: unknown }>) ?? {}) }
       : {
           routes: [],
           note: "No confident route match — Waymark refuses to guess rather than serve a wrong route.",
@@ -2868,6 +3018,14 @@ const GUIDE_FOR_DOMAIN: Record<string, { slug: string; title: string }> = {
   "twilio.com/docs/verify": { slug: "twilio-verify-authy-migration", title: "Twilio Verify for teams leaving Authy" },
   "typeform.com/developers": { slug: "typeform-webhook-hmac-verification", title: "Verify Typeform webhook HMAC signatures" },
   "developer.uber.com": { slug: "uber-direct-webhook-signature-verification", title: "Verify Uber Direct webhook signatures" },
+  // 2026-07-15: demand-matched guide (playground_top_asks #2, same-day repeat asks).
+  "api.yelp.com": { slug: "yelp-fusion-business-search", title: "Yelp Fusion (Places) business search — food trucks, category filters, and the limits that bite" },
+  "docs.developer.yelp.com": { slug: "yelp-fusion-business-search", title: "Yelp Fusion (Places) business search — food trucks, category filters, and the limits that bite" },
+  // 2026-07-15: demand-matched guide #2 — both Socrata queries in real_query_samples
+  // (NYC restaurant inspections + SODA app-token/throttling) are real MCP queries.
+  "dev.socrata.com": { slug: "socrata-soda-api-open-data-queries", title: "Socrata SODA API — app tokens, SoQL date filters, and the throttling that bites" },
+  "data.cityofnewyork.us": { slug: "socrata-soda-api-open-data-queries", title: "Socrata SODA API — app tokens, SoQL date filters, and the throttling that bites" },
+  "data.sfgov.org": { slug: "socrata-soda-api-open-data-queries", title: "Socrata SODA API — app tokens, SoQL date filters, and the throttling that bites" },
 };
 
 /** Slug-keyed view of GUIDE_FOR_DOMAIN for /routes/{slug} pages (built once
@@ -2898,7 +3056,7 @@ async function routeDomainPage(env: Env, slugRaw: string): Promise<Response> {
   // Item 57: synthetic e2e/test domains are excluded ⇒ their slug falls through
   // to the existing noindex 404 below (honest 404, item-17 convention).
   const idx = (await getIndex(env)).filter((r) => !isSyntheticTraffic(r.domain));
-  const matched = new Map<string, Route[]>();
+  const matched = new Map<string, IdxEntry[]>();
   for (const r of idx) {
     if (domainSlug(r.domain) !== slug) continue;
     const g = matched.get(r.domain) ?? [];
@@ -2922,7 +3080,7 @@ async function routeDomainPage(env: Env, slugRaw: string): Promise<Response> {
   const pageUrl = `https://mcp.waymark.network/routes/${slug}`;
   // Item 85: provider deep-dive guide link (see GUIDE_FOR_DOMAIN).
   const guide = guideForSlug(slug);
-  const trustLabel = (r: Route) => {
+  const trustLabel = (r: IdxEntry) => {
     const n = r.attestations.success + r.attestations.failure;
     return n > 0 ? Math.round((r.attestations.success / n) * 100) + "% success" : "unrated";
   };
@@ -2961,7 +3119,7 @@ async function routeDomainPage(env: Env, slugRaw: string): Promise<Response> {
     const head = domainNames.length > 1
       ? `<h2>${escapeHtml(d)} <span class="cnt">${rs.length} route${rs.length === 1 ? "" : "s"}</span></h2>` : "";
     return `${head}<div class="panel rel">${rs.map((r) =>
-      `<a href="/r/${r.id}" class="row" data-q="${escapeHtml(r.task.toLowerCase())}"><div class="rt">${escapeHtml(r.task)}</div><div class="rm">${r.steps.length} steps${r.gotchas.length ? ` · ${r.gotchas.length} gotcha${r.gotchas.length === 1 ? "" : "s"}` : ""} · ${trustLabel(r)}</div></a>`
+      `<a href="/r/${r.id}" class="row" data-q="${escapeHtml(r.task.toLowerCase())}"><div class="rt">${escapeHtml(r.task)}</div><div class="rm">${r.steps} steps${r.gotchas ? ` · ${r.gotchas} gotcha${r.gotchas === 1 ? "" : "s"}` : ""} · ${trustLabel(r)}</div></a>`
     ).join("")}</div>`;
   }).join("");
 
@@ -3267,7 +3425,7 @@ async function sitemap(env: Env): Promise<Response> {
   // or earns an attestation ⇒ lastmod = max(created, attestations.lastAt). The
   // per-domain browse pages and the index pages take the max lastmod of the routes
   // they aggregate (ISO-8601 Zulu strings sort lexicographically, so > is correct).
-  const routeMod = (r: Route): string => {
+  const routeMod = (r: IdxEntry): string => {
     const a = r.attestations?.lastAt;
     return a && a > r.created ? a : r.created;
   };
@@ -3364,12 +3522,16 @@ function openApiSpec(env: Env) {
               content: { "application/json": { schema: { type: "object", properties: { routes: { type: "array", maxItems: 0 }, error: { type: "string", const: "pro_required" }, detail: { type: "string" }, how: { type: "string" }, pricing: { type: "string", format: "uri" }, checkout: { type: "string", format: "uri" } } } } },
             },
             "200": {
-              description: "Ranked routes (possibly empty on a low-confidence/no-match query). Zero-result responses additionally carry `note` and `request_route` — the paid path to commission a fact-checked route for the unmatched task.",
+              description: "Ranked routes (possibly empty on a low-confidence/no-match query). Zero-result responses additionally carry `note` and `request_route` — the paid path to commission a fact-checked route for the unmatched task. When routes ARE returned but none are independently verified and the best decayed trust is still near the neutral prior, the response additionally carries `verify_cta` — the $25 bounty to get a verified route for the caller's exact stack.",
               headers: { "X-Search-Cache": { description: "`hit` if the retrieval result was served from edge cache, else `miss`.", schema: { type: "string", enum: ["hit", "miss"] } } },
               content: { "application/json": { schema: { type: "object", required: ["routes"], properties: {
                 routes: { type: "array", items: { $ref: "#/components/schemas/RouteResult" } },
                 note: { type: "string", description: "Present only when `routes` is empty: why nothing was served (Waymark refuses low-confidence matches rather than guess)." },
                 request_route: { type: "object", description: "Present only when `routes` is empty: how to commission a fact-checked route for this exact task ($25 bounty).", properties: {
+                  what: { type: "string" }, price_usd: { type: "number", const: 25 },
+                  url: { type: "string", format: "uri" }, checkout: { type: "string", format: "uri" },
+                } },
+                verify_cta: { type: "object", description: "Present only when routes were returned but none are independently verified and top decayed trust < 0.7: the $25 bounty to commission a live-tested verified route for this exact task.", properties: {
                   what: { type: "string" }, price_usd: { type: "number", const: 25 },
                   url: { type: "string", format: "uri" }, checkout: { type: "string", format: "uri" },
                 } },
