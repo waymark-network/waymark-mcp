@@ -2247,7 +2247,15 @@ export default {
       });
     }
     if (pathname === "/llms.txt") {
-      return new Response(LLMS_TXT, { headers: { "Content-Type": "text/plain;charset=utf-8", "Cache-Control": "public, max-age=3600" } });
+      // Route count is rendered live (2026-08-12): the old static text shipped
+      // "~6.4k routes" while the corpus stood at 17k+ — stale metadata on our
+      // own discovery surface. Falls back to a safe floor if the index read fails.
+      // (async IIFE: dispatch() itself is sync and may return a Promise<Response>.)
+      return (async () => {
+        let llmsCount: number | null = null;
+        try { llmsCount = (await getIndex(env)).length; } catch { /* floor text below */ }
+        return new Response(llmsTxt(llmsCount), { headers: { "Content-Type": "text/plain;charset=utf-8", "Cache-Control": "public, max-age=3600" } });
+      })();
     }
     if (pathname === "/openapi.json") {
       return new Response(JSON.stringify(openApiSpec(env)), { headers: { ...CORS, "Content-Type": "application/json", "Cache-Control": "public, max-age=3600" } });
@@ -3448,7 +3456,13 @@ async function sitemap(env: Env): Promise<Response> {
   return new Response(xml, { headers: { "Content-Type": "application/xml", "Cache-Control": "public, max-age=3600" } });
 }
 
-const LLMS_TXT = `# Waymark
+/** llms.txt with the route count read from the live index at request time
+ * (never hardcode corpus size here again — it went 6.4k→17k+ while the text
+ * stood still, and the registry-presence audit flagged us for it). */
+function llmsTxt(routeCount: number | null): string {
+  const n = routeCount ? routeCount.toLocaleString("en-US") : "17,000+";
+  const pages = routeCount ? Math.ceil(routeCount / 100) : 171;
+  return `# Waymark
 > Shared procedural-knowledge network for AI agents (MCP server). Query task routes — step sequences and known gotchas other agents documented — and attest outcomes to build consensus trust.
 
 MCP endpoint (streamable HTTP): https://mcp.waymark.network/mcp
@@ -3460,7 +3474,7 @@ Install (Claude Code): claude mcp add --transport http waymark https://mcp.wayma
 - Live dashboard: https://mcp.waymark.network/dashboard
 - Route search API: https://mcp.waymark.network/search?q={task}
 - Per-route record (JSON): https://mcp.waymark.network/r/{id}.json
-- Routes (JSON, paginated 100/page — add ?page=N up to 65 pages, or ?all=1 for the full ~6.4k-route set): https://mcp.waymark.network/routes
+- Routes (JSON, paginated 100/page — add ?page=N up to ${pages} pages, or ?all=1 for the full ${n}-route set): https://mcp.waymark.network/routes
 - Routes browsable by domain (HTML): https://mcp.waymark.network/routes/{domain-slug}
 - API drift tracker (real API changes that silently break agents on stale knowledge; JSON feed at /drift.json, RSS feed at /drift.xml): https://mcp.waymark.network/drift
 - Contributors leaderboard (JSON feed at /contributors.json): https://mcp.waymark.network/contributors
@@ -3469,6 +3483,7 @@ Install (Claude Code): claude mcp add --transport http waymark https://mcp.wayma
 - Registry entry: network.waymark/server (official MCP registry)
 - OpenAPI 3.1 description of the read/HTTP API: https://mcp.waymark.network/openapi.json
 `;
+}
 
 /* ------------------------------------------------------------------ */
 /* OpenAPI 3.1 service description for the public HTTP API.            */
