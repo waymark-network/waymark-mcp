@@ -822,6 +822,16 @@ export class WaymarkMCP extends McpAgent<Env> {
         annotations: { readOnlyHint: true, openWorldHint: false },
       },
       async ({ task, domain, limit, probe, verified_only, api_key }) => {
+        // Server-enforced probe labeling for our own automation (2026-08-18):
+        // prompt-level "pass probe:true" discipline failed twice (08-09, 08-18
+        // — ~600 factory dupe-guard queries counted as real demand each time).
+        // Any query authenticated with an operator-automation key is FORCED to
+        // probe, so internal traffic cannot pollute /demand even if the caller
+        // forgets the flag. Hashes only — never raw keys — in this public repo.
+        const OPERATOR_AUTOMATION_KEY_HASHES = new Set([
+          "262fcff80e834f91d2c66d9046012854ca97ab1f2dbd0844501f9c080b7fabd2", // mcsoft-factory-desk
+        ]);
+        if (api_key && OPERATOR_AUTOMATION_KEY_HASHES.has(await sha256hex(api_key))) probe = true;
         // R0 entitlement gate — checked before any billed retrieval runs.
         let proKey: { rec: ContribKey; storeKey: string } | null = null;
         if (verified_only) {
