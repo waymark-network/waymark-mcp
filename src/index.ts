@@ -822,15 +822,8 @@ export class WaymarkMCP extends McpAgent<Env> {
         annotations: { readOnlyHint: true, openWorldHint: false },
       },
       async ({ task, domain, limit, probe, verified_only, api_key }) => {
-        // Server-enforced probe labeling for our own automation (2026-08-18):
-        // prompt-level "pass probe:true" discipline failed twice (08-09, 08-18
-        // — ~600 factory dupe-guard queries counted as real demand each time).
-        // Any query authenticated with an operator-automation key is FORCED to
-        // probe, so internal traffic cannot pollute /demand even if the caller
-        // forgets the flag. Hashes only — never raw keys — in this public repo.
-        const OPERATOR_AUTOMATION_KEY_HASHES = new Set([
-          "262fcff80e834f91d2c66d9046012854ca97ab1f2dbd0844501f9c080b7fabd2", // mcsoft-factory-desk
-        ]);
+        // Metric-integrity enforcement: our own automation key can never log
+        // real demand, regardless of what the calling prompt forgot.
         if (api_key && OPERATOR_AUTOMATION_KEY_HASHES.has(await sha256hex(api_key))) probe = true;
         // R0 entitlement gate — checked before any billed retrieval runs.
         let proKey: { rec: ContribKey; storeKey: string } | null = null;
@@ -1320,6 +1313,16 @@ interface ContribKey { handle: string; created: string; revoked: boolean; contri
 function contribCapFor(rec: ContribKey): number {
   return rec.tier === "pro" ? CONTRIB_KEY_HOURLY_CAP * PRO_CAP_MULTIPLIER : CONTRIB_KEY_HOURLY_CAP;
 }
+
+/** Server-enforced probe (2026-08-12, metric-integrity incident #3): sha256
+ *  hashes of our OWN automation contributor keys (factory/newsroom/desk share
+ *  one persistent key). Any waymark_query bearing one of these keys is FORCED
+ *  to probe=true server-side, so a prompt bug in a scheduled run can never
+ *  count our internal traffic as real demand again. Hash-only — repo is
+ *  public; the raw key never appears here. */
+const OPERATOR_AUTOMATION_KEY_HASHES = new Set([
+  "262fcff80e834f91d2c66d9046012854ca97ab1f2dbd0844501f9c080b7fabd2", // X_FACTORY_CONTRIB_KEY (handle mcsoft-factory-desk)
+]);
 
 async function sha256hex(s: string): Promise<string> {
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
